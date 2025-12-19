@@ -84,15 +84,35 @@ fn validate_bgzf_header(header: &[u8]) -> bool {
     true
 }
 
-/// Full validation - iterates all blocks.
+/// Streaming validation - iterates all blocks without seeking.
+///
+/// This performs thorough validation by reading every BGZF block and
+/// verifying the structure. Unlike `validate_bgzf_strict`, this works
+/// on non-seekable streams (stdin, pipes). It reads and discards block
+/// data rather than seeking.
+pub fn validate_bgzf_streaming<R: Read>(reader: &mut R) -> Result<BgzfValidation> {
+    validate_bgzf_impl(reader)
+}
+
+/// Full validation - iterates all blocks (requires Seek).
 ///
 /// This performs thorough validation by reading every BGZF block header
 /// and verifying the structure. It also counts blocks and accumulates
-/// uncompressed sizes.
+/// uncompressed sizes. Seeks back to start when done.
 pub fn validate_bgzf_strict<R: Read + Seek>(reader: &mut R) -> Result<BgzfValidation> {
     // Start from beginning
     reader.seek(SeekFrom::Start(0))?;
 
+    let result = validate_bgzf_impl(reader)?;
+
+    // Seek back to start for potential fast-path copy
+    reader.seek(SeekFrom::Start(0))?;
+
+    Ok(result)
+}
+
+/// Internal validation implementation that works on any Read.
+fn validate_bgzf_impl<R: Read>(reader: &mut R) -> Result<BgzfValidation> {
     let mut block_count: u64 = 0;
     let mut total_uncompressed_size: u64 = 0;
 
@@ -128,11 +148,10 @@ pub fn validate_bgzf_strict<R: Read + Seek>(reader: &mut R) -> Result<BgzfValida
         let bsize = u16::from_le_bytes([header[16], header[17]]) as u64;
         let block_size = bsize + 1;
 
-        // Calculate remaining bytes to skip to next block
-        // We've read 18 bytes, need to skip to end of block
+        // Calculate remaining bytes in this block
+        // We've read 18 bytes, need to read to end of block
         let remaining = block_size.saturating_sub(MIN_HEADER_SIZE as u64);
 
-        // Read the footer to get ISIZE (uncompressed size)
         // Footer is last 8 bytes: 4 bytes CRC32 + 4 bytes ISIZE
         if remaining < 8 {
             // Block too small to have valid footer
@@ -143,10 +162,10 @@ pub fn validate_bgzf_strict<R: Read + Seek>(reader: &mut R) -> Result<BgzfValida
             });
         }
 
-        // Skip to footer (remaining - 8 bytes of footer)
+        // Read and discard data until footer
         let skip_to_footer = remaining - 8;
         if skip_to_footer > 0 {
-            reader.seek(SeekFrom::Current(skip_to_footer as i64))?;
+            std::io::copy(&mut reader.take(skip_to_footer), &mut std::io::sink())?;
         }
 
         // Read footer
@@ -165,9 +184,6 @@ pub fn validate_bgzf_strict<R: Read + Seek>(reader: &mut R) -> Result<BgzfValida
             break;
         }
     }
-
-    // Seek back to start for potential fast-path copy
-    reader.seek(SeekFrom::Start(0))?;
 
     Ok(BgzfValidation {
         is_valid_bgzf: true,
@@ -245,6 +261,28 @@ mod tests {
         ];
         let mut cursor = Cursor::new(&plain_gzip);
         let result = validate_bgzf_strict(&mut cursor).unwrap();
+
+        assert!(!result.is_valid_bgzf);
+    }
+
+    #[test]
+    fn test_validate_streaming_eof_only() {
+        let mut cursor = Cursor::new(&BGZF_EOF);
+        let result = validate_bgzf_streaming(&mut cursor).unwrap();
+
+        assert!(result.is_valid_bgzf);
+        assert_eq!(result.block_count, Some(1));
+        assert_eq!(result.total_uncompressed_size, Some(0));
+    }
+
+    #[test]
+    fn test_validate_streaming_plain_gzip() {
+        let plain_gzip = [
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        let mut cursor = Cursor::new(&plain_gzip);
+        let result = validate_bgzf_streaming(&mut cursor).unwrap();
 
         assert!(!result.is_valid_bgzf);
     }

@@ -10,8 +10,8 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 
 use rebgzf::{
-    is_bgzf, validate_bgzf_strict, ParallelTranscoder, SingleThreadedTranscoder, TranscodeConfig,
-    Transcoder,
+    is_bgzf, validate_bgzf_streaming, validate_bgzf_strict, ParallelTranscoder,
+    SingleThreadedTranscoder, TranscodeConfig, Transcoder,
 };
 
 // ============================================================================
@@ -779,4 +779,150 @@ fn test_cli_check_gzip() {
     assert!(!output.status.success(), "CLI should return 1 for gzip input");
 
     std::fs::remove_file(&gzip_path).ok();
+}
+
+// ============================================================================
+// Index Generation Tests
+// ============================================================================
+
+#[test]
+fn test_index_generation_single_thread() {
+    let data = generate_mixed_data(200_000);
+    let gzip_data = compress_to_gzip(&data);
+
+    let config = TranscodeConfig { build_index: true, ..Default::default() };
+    let mut transcoder = SingleThreadedTranscoder::new(config);
+    let mut output = Vec::new();
+
+    let stats = transcoder.transcode(Cursor::new(&gzip_data), &mut output).unwrap();
+
+    // Should have index entries
+    assert!(stats.index_entries.is_some());
+    let entries = stats.index_entries.unwrap();
+
+    // Should have entries for each data block
+    assert_eq!(entries.len(), stats.blocks_written as usize);
+
+    // First entry should be at offset 0
+    assert_eq!(entries[0].compressed_offset, 0);
+    assert_eq!(entries[0].uncompressed_offset, 0);
+
+    // Entries should be in ascending order
+    for i in 1..entries.len() {
+        assert!(entries[i].compressed_offset > entries[i - 1].compressed_offset);
+        assert!(entries[i].uncompressed_offset > entries[i - 1].uncompressed_offset);
+    }
+}
+
+#[test]
+fn test_index_generation_parallel() {
+    let data = generate_mixed_data(200_000);
+    let gzip_data = compress_to_gzip(&data);
+
+    let config = TranscodeConfig { build_index: true, num_threads: 4, ..Default::default() };
+    let mut transcoder = ParallelTranscoder::new(config);
+    let mut output = Vec::new();
+
+    let stats = transcoder.transcode(Cursor::new(&gzip_data), &mut output).unwrap();
+
+    // Should have index entries
+    assert!(stats.index_entries.is_some());
+    let entries = stats.index_entries.unwrap();
+
+    // Should have entries for each data block
+    assert_eq!(entries.len(), stats.blocks_written as usize);
+
+    // Verify entries are consistent with block structure
+    let blocks = parse_bgzf_blocks(&output);
+    let mut expected_compressed = 0u64;
+    let mut expected_uncompressed = 0u64;
+
+    for (i, (bsize, isize)) in blocks.iter().take(entries.len()).enumerate() {
+        assert_eq!(
+            entries[i].compressed_offset, expected_compressed,
+            "Entry {} compressed offset mismatch",
+            i
+        );
+        assert_eq!(
+            entries[i].uncompressed_offset, expected_uncompressed,
+            "Entry {} uncompressed offset mismatch",
+            i
+        );
+        expected_compressed += *bsize as u64;
+        expected_uncompressed += *isize as u64;
+    }
+}
+
+#[test]
+fn test_index_disabled_by_default() {
+    let data = generate_mixed_data(100_000);
+    let gzip_data = compress_to_gzip(&data);
+
+    let config = TranscodeConfig::default();
+    let mut transcoder = SingleThreadedTranscoder::new(config);
+    let mut output = Vec::new();
+
+    let stats = transcoder.transcode(Cursor::new(&gzip_data), &mut output).unwrap();
+
+    // Should not have index entries by default
+    assert!(stats.index_entries.is_none());
+}
+
+// ============================================================================
+// Streaming Validation Tests
+// ============================================================================
+
+#[test]
+fn test_streaming_validation_valid_bgzf() {
+    let data = generate_mixed_data(100_000);
+    let gzip_data = compress_to_gzip(&data);
+
+    // Create BGZF
+    let config = TranscodeConfig::default();
+    let mut transcoder = SingleThreadedTranscoder::new(config);
+    let mut bgzf_data = Vec::new();
+    transcoder.transcode(Cursor::new(&gzip_data), &mut bgzf_data).unwrap();
+
+    // Validate via streaming (simulating stdin)
+    let mut cursor = Cursor::new(&bgzf_data);
+    let validation = validate_bgzf_streaming(&mut cursor).unwrap();
+
+    assert!(validation.is_valid_bgzf);
+    assert!(validation.block_count.is_some());
+    assert!(validation.total_uncompressed_size.is_some());
+    assert_eq!(validation.total_uncompressed_size.unwrap(), data.len() as u64);
+}
+
+#[test]
+fn test_streaming_validation_matches_strict() {
+    let data = generate_mixed_data(150_000);
+    let gzip_data = compress_to_gzip(&data);
+
+    // Create BGZF
+    let config = TranscodeConfig::default();
+    let mut transcoder = SingleThreadedTranscoder::new(config);
+    let mut bgzf_data = Vec::new();
+    transcoder.transcode(Cursor::new(&gzip_data), &mut bgzf_data).unwrap();
+
+    // Validate both ways
+    let mut cursor_streaming = Cursor::new(&bgzf_data);
+    let streaming = validate_bgzf_streaming(&mut cursor_streaming).unwrap();
+
+    let mut cursor_strict = Cursor::new(&bgzf_data);
+    let strict = validate_bgzf_strict(&mut cursor_strict).unwrap();
+
+    // Results should match
+    assert_eq!(streaming.is_valid_bgzf, strict.is_valid_bgzf);
+    assert_eq!(streaming.block_count, strict.block_count);
+    assert_eq!(streaming.total_uncompressed_size, strict.total_uncompressed_size);
+}
+
+#[test]
+fn test_streaming_validation_invalid() {
+    let gzip_data = compress_to_gzip(b"Hello, World!");
+
+    let mut cursor = Cursor::new(&gzip_data);
+    let validation = validate_bgzf_streaming(&mut cursor).unwrap();
+
+    assert!(!validation.is_valid_bgzf);
 }

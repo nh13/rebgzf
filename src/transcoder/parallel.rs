@@ -12,7 +12,7 @@ use crossbeam::channel::{bounded, Receiver, Sender};
 
 use super::boundary::{tokens_to_bytes, BoundaryResolver};
 use super::splitter::{BlockSplitter, DefaultSplitter, FastqSplitter};
-use crate::bgzf::BGZF_EOF;
+use crate::bgzf::{GziEntry, BGZF_EOF};
 use crate::deflate::{DeflateParser, LZ77Token};
 use crate::error::{Error, Result};
 use crate::gzip::GzipHeader;
@@ -35,6 +35,8 @@ struct EncodedBlock {
     block_id: u64,
     /// Raw BGZF block data (header + deflate + footer)
     data: Vec<u8>,
+    /// Uncompressed size for index building
+    uncompressed_size: u32,
 }
 
 /// Parallel transcoder implementation
@@ -155,6 +157,12 @@ impl ParallelTranscoder {
         let mut blocks_written: u64 = 0;
         let mut output_bytes: u64 = 0;
 
+        // Index tracking (compressed and uncompressed offsets)
+        let build_index = self.config.build_index;
+        let mut index_entries: Vec<GziEntry> = Vec::new();
+        let mut current_compressed_offset: u64 = 0;
+        let mut current_uncompressed_offset: u64 = 0;
+
         // Buffer for out-of-order blocks
         let mut pending_blocks: BTreeMap<u64, EncodedBlock> = BTreeMap::new();
         let mut next_write_id: u64 = 0;
@@ -223,6 +231,10 @@ impl ParallelTranscoder {
                                                 &mut next_write_id,
                                                 &mut blocks_written,
                                                 &mut output_bytes,
+                                                build_index,
+                                                &mut index_entries,
+                                                &mut current_compressed_offset,
+                                                &mut current_uncompressed_offset,
                                             )?;
                                         }
                                         Err(_) => {
@@ -280,6 +292,10 @@ impl ParallelTranscoder {
                         &mut next_write_id,
                         &mut blocks_written,
                         &mut output_bytes,
+                        build_index,
+                        &mut index_entries,
+                        &mut current_compressed_offset,
+                        &mut current_uncompressed_offset,
                     )?;
                 }
                 Err(_) => break,
@@ -288,8 +304,16 @@ impl ParallelTranscoder {
 
         // Write any remaining buffered blocks
         while let Some(block) = pending_blocks.remove(&next_write_id) {
-            output_bytes += block.data.len() as u64;
-            writer.write_all(&block.data)?;
+            Self::write_single_block(
+                &mut writer,
+                &block.data,
+                block.uncompressed_size,
+                &mut output_bytes,
+                build_index,
+                &mut index_entries,
+                &mut current_compressed_offset,
+                &mut current_uncompressed_offset,
+            )?;
             blocks_written += 1;
             next_write_id += 1;
         }
@@ -308,9 +332,11 @@ impl ParallelTranscoder {
             blocks_written,
             boundary_refs_resolved: refs_resolved,
             copied_directly: false,
+            index_entries: if build_index { Some(index_entries) } else { None },
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn buffer_and_write_block<W: Write>(
         writer: &mut W,
         block: EncodedBlock,
@@ -318,18 +344,38 @@ impl ParallelTranscoder {
         next_write_id: &mut u64,
         blocks_written: &mut u64,
         output_bytes: &mut u64,
+        build_index: bool,
+        index_entries: &mut Vec<GziEntry>,
+        current_compressed_offset: &mut u64,
+        current_uncompressed_offset: &mut u64,
     ) -> Result<()> {
         if block.block_id == *next_write_id {
-            // Write this block
-            *output_bytes += block.data.len() as u64;
-            writer.write_all(&block.data)?;
+            // Write this block and track index
+            Self::write_single_block(
+                writer,
+                &block.data,
+                block.uncompressed_size,
+                output_bytes,
+                build_index,
+                index_entries,
+                current_compressed_offset,
+                current_uncompressed_offset,
+            )?;
             *blocks_written += 1;
             *next_write_id += 1;
 
             // Write any consecutive buffered blocks
             while let Some(buffered) = pending.remove(next_write_id) {
-                *output_bytes += buffered.data.len() as u64;
-                writer.write_all(&buffered.data)?;
+                Self::write_single_block(
+                    writer,
+                    &buffered.data,
+                    buffered.uncompressed_size,
+                    output_bytes,
+                    build_index,
+                    index_entries,
+                    current_compressed_offset,
+                    current_uncompressed_offset,
+                )?;
                 *blocks_written += 1;
                 *next_write_id += 1;
             }
@@ -337,6 +383,36 @@ impl ParallelTranscoder {
             // Buffer out-of-order block
             pending.insert(block.block_id, block);
         }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_single_block<W: Write>(
+        writer: &mut W,
+        data: &[u8],
+        uncompressed_size: u32,
+        output_bytes: &mut u64,
+        build_index: bool,
+        index_entries: &mut Vec<GziEntry>,
+        current_compressed_offset: &mut u64,
+        current_uncompressed_offset: &mut u64,
+    ) -> Result<()> {
+        // Record index entry before writing
+        if build_index {
+            index_entries.push(GziEntry {
+                compressed_offset: *current_compressed_offset,
+                uncompressed_offset: *current_uncompressed_offset,
+            });
+        }
+
+        // Write the block
+        *output_bytes += data.len() as u64;
+        writer.write_all(data)?;
+
+        // Update offsets for next block
+        *current_compressed_offset += data.len() as u64;
+        *current_uncompressed_offset += uncompressed_size as u64;
+
         Ok(())
     }
 }
@@ -415,7 +491,7 @@ fn encode_block(encoder: &mut HuffmanEncoder, job: EncodingJob) -> Result<Encode
     data.extend_from_slice(&crc.to_le_bytes());
     data.extend_from_slice(&isize.to_le_bytes());
 
-    Ok(EncodedBlock { block_id: job.block_id, data })
+    Ok(EncodedBlock { block_id: job.block_id, data, uncompressed_size: isize })
 }
 
 #[cfg(test)]

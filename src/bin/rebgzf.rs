@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use rebgzf::{
-    is_bgzf, validate_bgzf_strict, BgzfValidation, CompressionLevel, FormatProfile,
-    ParallelTranscoder, SingleThreadedTranscoder, TranscodeConfig, Transcoder,
+    is_bgzf, validate_bgzf_streaming, validate_bgzf_strict, BgzfValidation, CompressionLevel,
+    FormatProfile, ParallelTranscoder, SingleThreadedTranscoder, TranscodeConfig, Transcoder,
 };
 
 /// Format argument for CLI (maps to FormatProfile)
@@ -81,6 +81,10 @@ struct Args {
     /// Show progress during transcoding (throughput display)
     #[arg(short = 'p', long)]
     progress: bool,
+
+    /// Write GZI index file (for random access). If no path given, uses output.gzi
+    #[arg(long, value_name = "PATH")]
+    index: Option<Option<PathBuf>>,
 }
 
 /// Exit codes for --check mode
@@ -209,6 +213,10 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
     // Normal transcoding mode - output is required
     let output_path = args.output.as_ref().expect("output required when not in check mode");
 
+    // Determine I/O modes early (needed for index path logic)
+    let is_stdin = args.input.to_str() == Some("-");
+    let is_stdout = output_path.to_str() == Some("-");
+
     // Resolve format profile (Auto -> detected from extension)
     let format = args.format.to_format_profile().resolve(Some(&args.input));
 
@@ -220,6 +228,21 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
         CompressionLevel::from_level(args.level)
     };
 
+    // Determine index output path
+    let index_path: Option<PathBuf> = match &args.index {
+        Some(Some(path)) => Some(path.clone()),
+        Some(None) => {
+            // --index without path: use output.gzi
+            if !is_stdout {
+                Some(output_path.with_extension("bgzf.gzi"))
+            } else {
+                eprintln!("Warning: --index requires an explicit path when output is stdout");
+                None
+            }
+        }
+        None => None,
+    };
+
     let config = TranscodeConfig {
         block_size: args.block_size,
         compression_level,
@@ -227,12 +250,9 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
         num_threads: args.threads,
         strict_bgzf_check: args.strict,
         force_transcode: args.force,
+        build_index: index_path.is_some(),
         ..Default::default()
     };
-
-    // Open input
-    let is_stdin = args.input.to_str() == Some("-");
-    let is_stdout = output_path.to_str() == Some("-");
 
     // Check for BGZF fast-path (only for file inputs, not stdin)
     if !config.force_transcode && !is_stdin {
@@ -349,6 +369,23 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
         let _ = handle.join();
     }
 
+    // Write index file if requested
+    if let (Some(path), Some(entries)) = (&index_path, &stats.index_entries) {
+        let mut index_file = BufWriter::new(File::create(path)?);
+        // Write number of entries (u64 LE)
+        index_file.write_all(&(entries.len() as u64).to_le_bytes())?;
+        // Write each entry (compressed_offset, uncompressed_offset as u64 LE pairs)
+        for entry in entries {
+            index_file.write_all(&entry.compressed_offset.to_le_bytes())?;
+            index_file.write_all(&entry.uncompressed_offset.to_le_bytes())?;
+        }
+        index_file.flush()?;
+
+        if args.verbose {
+            eprintln!("Index written: {} ({} entries)", path.display(), entries.len());
+        }
+    }
+
     if args.verbose || args.progress {
         eprintln!("Transcoding complete:");
         eprintln!("  Input bytes:      {}", stats.input_bytes);
@@ -369,15 +406,16 @@ fn run_check_mode(args: &Args) -> Result<u8, Box<dyn std::error::Error>> {
     let is_stdin = args.input.to_str() == Some("-");
 
     let validation = if is_stdin {
-        // For stdin, we can only do quick check (can't seek)
-        if args.strict {
-            eprintln!("Warning: --strict requires seekable input, using quick check for stdin");
-        }
         let mut stdin = io::stdin().lock();
-        BgzfValidation {
-            is_valid_bgzf: is_bgzf(&mut stdin)?,
-            block_count: None,
-            total_uncompressed_size: None,
+        if args.strict {
+            // Use streaming validation for stdin (no seek required)
+            validate_bgzf_streaming(&mut stdin)?
+        } else {
+            BgzfValidation {
+                is_valid_bgzf: is_bgzf(&mut stdin)?,
+                block_count: None,
+                total_uncompressed_size: None,
+            }
         }
     } else {
         let mut file = BufReader::new(File::open(&args.input)?);

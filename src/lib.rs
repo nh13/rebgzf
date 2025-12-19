@@ -6,7 +6,10 @@ pub mod gzip;
 pub mod huffman;
 pub mod transcoder;
 
-pub use bgzf::{is_bgzf, validate_bgzf_strict, BgzfValidation};
+pub use bgzf::{
+    is_bgzf, validate_bgzf_streaming, validate_bgzf_strict, BgzfValidation, GziEntry,
+    GziIndexBuilder,
+};
 pub use deflate::tokens::LZ77Token;
 pub use error::{Error, Result};
 pub use transcoder::{parallel::ParallelTranscoder, single::SingleThreadedTranscoder};
@@ -117,6 +120,8 @@ pub struct TranscodeConfig {
     pub strict_bgzf_check: bool,
     /// Skip BGZF detection entirely (always transcode)
     pub force_transcode: bool,
+    /// Build GZI index during transcoding
+    pub build_index: bool,
 }
 
 impl TranscodeConfig {
@@ -141,6 +146,7 @@ impl Default for TranscodeConfig {
             buffer_size: 128 * 1024,
             strict_bgzf_check: false,
             force_transcode: false,
+            build_index: false,
         }
     }
 }
@@ -154,6 +160,8 @@ pub struct TranscodeStats {
     pub boundary_refs_resolved: u64,
     /// Input was already valid BGZF and was copied directly
     pub copied_directly: bool,
+    /// GZI index entries (populated when build_index is true)
+    pub index_entries: Option<Vec<GziEntry>>,
 }
 
 /// Trait for the complete transcoding operation

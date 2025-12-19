@@ -1,6 +1,6 @@
 use super::boundary::BoundaryResolver;
 use super::splitter::{BlockSplitter, DefaultSplitter, FastqSplitter};
-use crate::bgzf::BgzfBlockWriter;
+use crate::bgzf::{BgzfBlockWriter, GziIndexBuilder};
 use crate::deflate::{DeflateParser, LZ77Token};
 use crate::error::Result;
 use crate::gzip::GzipHeader;
@@ -55,6 +55,10 @@ impl Transcoder for SingleThreadedTranscoder {
         let mut pending_uncompressed_size: usize = 0;
         let mut block_start_position: u64 = 0;
 
+        // Optional index builder
+        let mut index_builder =
+            if self.config.build_index { Some(GziIndexBuilder::new()) } else { None };
+
         // Statistics
         let mut stats = TranscodeStats::default();
 
@@ -100,6 +104,7 @@ impl Transcoder for SingleThreadedTranscoder {
                             &pending_tokens,
                             block_start_position,
                             &mut stats,
+                            &mut index_builder,
                         )?;
 
                         block_start_position = resolver.position();
@@ -132,6 +137,7 @@ impl Transcoder for SingleThreadedTranscoder {
                 &pending_tokens,
                 block_start_position,
                 &mut stats,
+                &mut index_builder,
             )?;
         }
 
@@ -142,6 +148,9 @@ impl Transcoder for SingleThreadedTranscoder {
         let (resolved, _preserved) = resolver.stats();
         stats.boundary_refs_resolved = resolved;
 
+        // Extract index entries if building
+        stats.index_entries = index_builder.map(|b| b.entries().to_vec());
+
         // Flush writer
         let _ = bgzf_writer.finish()?;
 
@@ -150,6 +159,7 @@ impl Transcoder for SingleThreadedTranscoder {
 }
 
 impl SingleThreadedTranscoder {
+    #[allow(clippy::too_many_arguments)]
     fn emit_block<W: Write>(
         &self,
         resolver: &mut BoundaryResolver,
@@ -158,6 +168,7 @@ impl SingleThreadedTranscoder {
         tokens: &[LZ77Token],
         block_start: u64,
         stats: &mut TranscodeStats,
+        index_builder: &mut Option<GziIndexBuilder>,
     ) -> Result<()> {
         // Resolve cross-boundary references (also computes CRC)
         let (resolved, crc, uncompressed_size) = resolver.resolve_block(block_start, tokens);
@@ -168,9 +179,17 @@ impl SingleThreadedTranscoder {
         // Write BGZF block with pre-computed CRC
         bgzf_writer.write_block_with_crc(&deflate_data, crc, uncompressed_size)?;
 
+        // BGZF block size: 18 header + deflate + 8 footer
+        let compressed_block_size = (18 + deflate_data.len() + 8) as u64;
+
+        // Update index if building
+        if let Some(ref mut builder) = index_builder {
+            builder.add_block(compressed_block_size, uncompressed_size as u64);
+        }
+
         // Update stats
         stats.blocks_written += 1;
-        stats.output_bytes += (18 + deflate_data.len() + 8) as u64;
+        stats.output_bytes += compressed_block_size;
 
         Ok(())
     }
