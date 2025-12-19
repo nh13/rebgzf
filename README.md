@@ -79,15 +79,30 @@ cargo install rebgzf
 ### Command Line
 
 ```bash
-# Basic transcoding
+# Basic transcoding (fastest, level 1)
 rebgzf -i input.gz -o output.bgz
 
+# With progress display
+rebgzf -i input.gz -o output.bgz --progress
+
+# Better compression with dynamic Huffman (level 6)
+rebgzf -i input.gz -o output.bgz --level 6
+
+# Best compression for FASTQ files (dynamic Huffman + record-aligned blocks)
+rebgzf -i reads.fastq.gz -o reads.bgz --format fastq --level 9
+
+# Generate GZI index for random access
+rebgzf -i data.gz -o data.bgz --index
+
 # Parallel transcoding (auto-detect threads)
-rebgzf -i input.gz -o output.bgz -t 0
+rebgzf -i input.gz -o output.bgz -t 0 --progress
 
 # Check if a file is already BGZF
 rebgzf --check -i input.gz
 echo $?  # 0 = BGZF, 1 = not BGZF
+
+# Strict validation (all blocks, works with stdin)
+cat file.bgz | rebgzf --check --strict -i -
 
 # Force transcoding even if already BGZF
 rebgzf -i input.bgz -o output.bgz --force
@@ -108,7 +123,12 @@ Options:
   -i, --input <INPUT>            Input gzip file (use - for stdin)
   -o, --output <OUTPUT>          Output BGZF file (use - for stdout)
   -t, --threads <THREADS>        Number of threads (0 = auto, 1 = single-threaded) [default: 1]
+  -l, --level <LEVEL>            Compression level 1-9 (1-3: fixed Huffman, 4-6: dynamic,
+                                 7-9: dynamic + smart boundaries) [default: 1]
+      --format <FORMAT>          Input format profile: default, fastq, auto [default: default]
       --block-size <BLOCK_SIZE>  BGZF block size (default: 65280) [default: 65280]
+      --index [PATH]             Write GZI index file (enables random access)
+  -p, --progress                 Show progress during transcoding
   -v, --verbose                  Show verbose statistics
       --check                    Check if input is BGZF and exit (0=BGZF, 1=not BGZF, 2=error)
       --strict                   Validate all BGZF blocks (slower, more thorough)
@@ -121,7 +141,10 @@ Options:
 ### As a Library
 
 ```rust
-use rebgzf::{ParallelTranscoder, TranscodeConfig, Transcoder};
+use rebgzf::{
+    CompressionLevel, FormatProfile, ParallelTranscoder,
+    TranscodeConfig, Transcoder
+};
 use std::fs::File;
 
 fn main() -> rebgzf::Result<()> {
@@ -130,6 +153,9 @@ fn main() -> rebgzf::Result<()> {
 
     let config = TranscodeConfig {
         num_threads: 0,  // auto-detect
+        compression_level: CompressionLevel::Level6,  // dynamic Huffman
+        format: FormatProfile::Fastq,  // FASTQ-aware splitting
+        build_index: true,  // generate GZI index entries
         ..Default::default()
     };
 
@@ -142,6 +168,12 @@ fn main() -> rebgzf::Result<()> {
         stats.blocks_written
     );
 
+    // Write index if requested
+    if let Some(entries) = stats.index_entries {
+        println!("Generated {} index entries", entries.len());
+        // Write entries to .gzi file...
+    }
+
     Ok(())
 }
 ```
@@ -149,10 +181,11 @@ fn main() -> rebgzf::Result<()> {
 ### BGZF Detection
 
 ```rust
-use rebgzf::{is_bgzf, validate_bgzf_strict};
+use rebgzf::{is_bgzf, validate_bgzf_strict, validate_bgzf_streaming};
 use std::fs::File;
+use std::io::{Seek, SeekFrom};
 
-fn main() -> std::io::Result<()> {
+fn main() -> rebgzf::Result<()> {
     let mut file = File::open("input.gz")?;
 
     // Quick check (reads first 18 bytes)
@@ -160,16 +193,17 @@ fn main() -> std::io::Result<()> {
         println!("File appears to be BGZF");
     }
 
-    // Strict validation (validates all blocks)
-    file.rewind()?;
-    match validate_bgzf_strict(&mut file)? {
-        rebgzf::BgzfValidation::Valid { block_count } => {
-            println!("Valid BGZF with {} blocks", block_count);
-        }
-        rebgzf::BgzfValidation::Invalid { reason } => {
-            println!("Not valid BGZF: {}", reason);
-        }
+    // Strict validation (validates all blocks, requires Seek)
+    file.seek(SeekFrom::Start(0))?;
+    let validation = validate_bgzf_strict(&mut file)?;
+    if validation.is_valid_bgzf {
+        println!("Valid BGZF with {} blocks, {} uncompressed bytes",
+            validation.block_count.unwrap_or(0),
+            validation.total_uncompressed_size.unwrap_or(0));
     }
+
+    // Streaming validation (works with stdin/pipes, no Seek required)
+    // let validation = validate_bgzf_streaming(&mut stdin)?;
 
     Ok(())
 }
@@ -195,7 +229,12 @@ When splitting into BGZF blocks, back-references may point across block boundari
 
 ### Re-encoding
 
-Tokens are re-encoded using **fixed Huffman tables** (RFC 1951 section 3.2.6). This avoids the overhead of computing optimal Huffman codes for each block while providing reasonable compression.
+Tokens are re-encoded using either:
+
+- **Fixed Huffman tables** (levels 1-3): Fast encoding using pre-defined tables (RFC 1951 section 3.2.6)
+- **Dynamic Huffman tables** (levels 4-9): Per-block optimal tables computed from token frequencies
+
+At levels 7-9 with `--format fastq`, block boundaries are aligned to FASTQ record boundaries for better compression.
 
 ## Optimization Techniques
 
@@ -261,7 +300,7 @@ Uses the `crc32fast` crate which automatically leverages:
 ┌─────────────────────────────────────────────────────────────┐
 │  Huffman Encoder (HuffmanEncoder)                           │
 │  - Re-encodes tokens to DEFLATE format                      │
-│  - Uses fixed tables (faster) or dynamic (smaller)          │
+│  - Fixed tables (levels 1-3) or dynamic (levels 4-9)        │
 └─────────────────────────────────────────────────────────────┘
                               │
                               ▼
