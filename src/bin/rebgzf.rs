@@ -3,11 +3,32 @@ use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use rebgzf::{
-    is_bgzf, validate_bgzf_strict, BgzfValidation, ParallelTranscoder, SingleThreadedTranscoder,
-    TranscodeConfig, Transcoder,
+    is_bgzf, validate_bgzf_strict, BgzfValidation, CompressionLevel, FormatProfile,
+    ParallelTranscoder, SingleThreadedTranscoder, TranscodeConfig, Transcoder,
 };
+
+/// Format argument for CLI (maps to FormatProfile)
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum FormatArg {
+    /// Default encoding (fixed Huffman at level 1-3, dynamic at 4+)
+    Default,
+    /// FASTQ-optimized (implies level 6+ and record-aligned boundaries)
+    Fastq,
+    /// Auto-detect from file extension
+    Auto,
+}
+
+impl FormatArg {
+    fn to_format_profile(self) -> FormatProfile {
+        match self {
+            Self::Default => FormatProfile::Default,
+            Self::Fastq => FormatProfile::Fastq,
+            Self::Auto => FormatProfile::Auto,
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "rebgzf")]
@@ -26,9 +47,13 @@ struct Args {
     #[arg(short = 't', long, default_value = "1")]
     threads: usize,
 
-    /// Use fixed Huffman tables (currently always enabled; dynamic Huffman not yet implemented)
-    #[arg(long, hide = true)]
-    fixed_huffman: bool,
+    /// Compression level (1-9): 1-3=fixed Huffman (fast), 4-6=dynamic, 7-9=dynamic+smart boundaries
+    #[arg(short = 'l', long, default_value = "1", value_parser = clap::value_parser!(u8).range(1..=9))]
+    level: u8,
+
+    /// Input format profile for optimization
+    #[arg(long, value_enum, default_value = "default")]
+    format: FormatArg,
 
     /// BGZF block size (default: 65280)
     #[arg(long, default_value = "65280")]
@@ -77,9 +102,21 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
     // Normal transcoding mode - output is required
     let output_path = args.output.as_ref().expect("output required when not in check mode");
 
+    // Resolve format profile (Auto -> detected from extension)
+    let format = args.format.to_format_profile().resolve(Some(&args.input));
+
+    // Determine effective compression level
+    // --format fastq implies at least level 6 for dynamic Huffman
+    let compression_level = if format == FormatProfile::Fastq && args.level < 6 {
+        CompressionLevel::Level6
+    } else {
+        CompressionLevel::from_level(args.level)
+    };
+
     let config = TranscodeConfig {
         block_size: args.block_size,
-        use_fixed_huffman: args.fixed_huffman,
+        compression_level,
+        format,
         num_threads: args.threads,
         strict_bgzf_check: args.strict,
         force_transcode: args.force,

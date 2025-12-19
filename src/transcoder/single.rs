@@ -31,7 +31,7 @@ impl Transcoder for SingleThreadedTranscoder {
         // Phase 2: Initialize components
         let mut parser = DeflateParser::new(&mut reader);
         let mut resolver = BoundaryResolver::new();
-        let mut encoder = HuffmanEncoder::new(self.config.use_fixed_huffman);
+        let mut encoder = HuffmanEncoder::new(self.config.use_fixed_huffman());
         let mut bgzf_writer = BgzfBlockWriter::new(&mut writer);
 
         // Accumulator for current BGZF block

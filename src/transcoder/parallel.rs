@@ -85,7 +85,7 @@ impl ParallelTranscoder {
             bounded(channel_capacity);
 
         // Shared config for workers
-        let use_fixed_huffman = self.config.use_fixed_huffman;
+        let use_fixed_huffman = self.config.use_fixed_huffman();
 
         // Use crossbeam's scoped threads to avoid 'static lifetime requirements
         let result = crossbeam::scope(|scope| {
