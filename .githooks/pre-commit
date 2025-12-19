@@ -1,0 +1,25 @@
+#!/bin/bash
+# Pre-commit hook for rebgzf
+# Runs formatting check and clippy before allowing commits
+
+set -e
+
+echo "Running pre-commit checks..."
+
+# Check formatting
+echo "Checking formatting..."
+if ! cargo fmt --check 2>/dev/null; then
+    echo ""
+    echo "ERROR: Code is not formatted. Run 'cargo fmt' to fix."
+    exit 1
+fi
+
+# Run clippy
+echo "Running clippy..."
+if ! cargo clippy --all-targets -- -D warnings 2>/dev/null; then
+    echo ""
+    echo "ERROR: Clippy found issues. Fix them before committing."
+    exit 1
+fi
+
+echo "Pre-commit checks passed!"

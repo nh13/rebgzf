@@ -13,7 +13,12 @@ impl<W: Write> BgzfBlockWriter<W> {
     }
 
     /// Write a BGZF block with pre-encoded deflate data and pre-computed CRC
-    pub fn write_block_with_crc(&mut self, deflate_data: &[u8], crc: u32, isize: u32) -> Result<()> {
+    pub fn write_block_with_crc(
+        &mut self,
+        deflate_data: &[u8],
+        crc: u32,
+        isize: u32,
+    ) -> Result<()> {
         let block_size = BGZF_HEADER_SIZE + deflate_data.len() + BGZF_FOOTER_SIZE;
 
         if block_size > MAX_BGZF_BLOCK_SIZE {

@@ -158,9 +158,14 @@ impl ParallelTranscoder {
                         && !pending_tokens.is_empty()
                     {
                         // Resolve boundaries only - workers will compute CRC in parallel
-                        let (resolved, uncompressed_size) = resolver.resolve_block_for_parallel(block_start_position, &pending_tokens);
+                        let (resolved, uncompressed_size) = resolver
+                            .resolve_block_for_parallel(block_start_position, &pending_tokens);
 
-                        let job = EncodingJob { block_id: next_block_id, tokens: resolved, uncompressed_size };
+                        let job = EncodingJob {
+                            block_id: next_block_id,
+                            tokens: resolved,
+                            uncompressed_size,
+                        };
                         next_block_id += 1;
 
                         // Send job, draining results as needed to prevent deadlock
@@ -217,7 +222,8 @@ impl ParallelTranscoder {
 
         // Flush remaining tokens
         if !pending_tokens.is_empty() {
-            let (resolved, uncompressed_size) = resolver.resolve_block_for_parallel(block_start_position, &pending_tokens);
+            let (resolved, uncompressed_size) =
+                resolver.resolve_block_for_parallel(block_start_position, &pending_tokens);
 
             let job = EncodingJob { block_id: next_block_id, tokens: resolved, uncompressed_size };
             next_block_id += 1;
@@ -377,7 +383,6 @@ fn encode_block(encoder: &mut HuffmanEncoder, job: EncodingJob) -> Result<Encode
 
     Ok(EncodedBlock { block_id: job.block_id, data })
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -59,7 +59,11 @@ impl BoundaryResolver {
     ///
     /// This version computes CRC inline, which is efficient when the main thread
     /// is doing all the work anyway.
-    pub fn resolve_block(&mut self, block_start: u64, tokens: &[LZ77Token]) -> (Vec<LZ77Token>, u32, u32) {
+    pub fn resolve_block(
+        &mut self,
+        block_start: u64,
+        tokens: &[LZ77Token],
+    ) -> (Vec<LZ77Token>, u32, u32) {
         let mut output = Vec::with_capacity(tokens.len());
         let mut hasher = crc32fast::Hasher::new();
         let mut uncompressed_size: u32 = 0;
@@ -122,7 +126,11 @@ impl BoundaryResolver {
     /// Returns: (tokens with cross-boundary references resolved, uncompressed size)
     ///
     /// This version does NOT compute CRC - workers will do that in parallel.
-    pub fn resolve_block_for_parallel(&mut self, block_start: u64, tokens: &[LZ77Token]) -> (Vec<LZ77Token>, u32) {
+    pub fn resolve_block_for_parallel(
+        &mut self,
+        block_start: u64,
+        tokens: &[LZ77Token],
+    ) -> (Vec<LZ77Token>, u32) {
         let mut output = Vec::with_capacity(tokens.len());
         let mut uncompressed_size: u32 = 0;
 

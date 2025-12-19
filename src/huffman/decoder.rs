@@ -96,7 +96,7 @@ impl HuffmanDecoder {
         let mut symbols_with_len: Vec<(u16, u8, u32)> = Vec::new(); // (symbol, length, code)
 
         // Assign codes to symbols and populate lookup table
-        let mut current_code = next_code.clone();
+        let mut current_code = next_code;
         for (sym, &len) in lengths.iter().enumerate() {
             if len == 0 {
                 continue;
@@ -133,12 +133,7 @@ impl HuffmanDecoder {
             symbol_idx += bl_count[bits] as usize;
         }
 
-        Ok(Self {
-            lookup,
-            bit_info,
-            symbols: sorted_symbols,
-            max_bits,
-        })
+        Ok(Self { lookup, bit_info, symbols: sorted_symbols, max_bits })
     }
 
     /// Build fixed Huffman table for literal/length codes (RFC 1951 section 3.2.6)
