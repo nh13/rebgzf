@@ -141,68 +141,77 @@ impl ParallelTranscoder {
         let mut pending_blocks: BTreeMap<u64, EncodedBlock> = BTreeMap::new();
         let mut next_write_id: u64 = 0;
 
-        // Main parsing loop
-        while let Some(deflate_block) = parser.parse_block()? {
-            for token in deflate_block.tokens.iter() {
-                if matches!(token, LZ77Token::EndOfBlock) {
-                    continue;
-                }
+        // Main parsing loop - handles multiple gzip members
+        loop {
+            // Process all DEFLATE blocks in current gzip member
+            while let Some(deflate_block) = parser.parse_block()? {
+                for token in deflate_block.tokens.iter() {
+                    if matches!(token, LZ77Token::EndOfBlock) {
+                        continue;
+                    }
 
-                let token_size = token.uncompressed_size();
+                    let token_size = token.uncompressed_size();
 
-                // Check if adding this token would exceed BGZF block size
-                if pending_uncompressed_size + token_size > self.config.block_size
-                    && !pending_tokens.is_empty()
-                {
-                    // Resolve boundaries and send job
-                    let resolved = resolver.resolve_block(block_start_position, &pending_tokens);
+                    // Check if adding this token would exceed BGZF block size
+                    if pending_uncompressed_size + token_size > self.config.block_size
+                        && !pending_tokens.is_empty()
+                    {
+                        // Resolve boundaries and send job
+                        let resolved = resolver.resolve_block(block_start_position, &pending_tokens);
 
-                    let job = EncodingJob { block_id: next_block_id, tokens: resolved };
-                    next_block_id += 1;
+                        let job = EncodingJob { block_id: next_block_id, tokens: resolved };
+                        next_block_id += 1;
 
-                    // Send job, draining results as needed to prevent deadlock
-                    let mut job_to_send = Some(job);
-                    while job_to_send.is_some() {
-                        crossbeam::channel::select! {
-                            send(job_tx, job_to_send.clone().unwrap()) -> res => {
-                                match res {
-                                    Ok(()) => { job_to_send = None; }
-                                    Err(_) => {
-                                        return Err(Error::Internal("Workers disconnected".to_string()));
+                        // Send job, draining results as needed to prevent deadlock
+                        let mut job_to_send = Some(job);
+                        while job_to_send.is_some() {
+                            crossbeam::channel::select! {
+                                send(job_tx, job_to_send.clone().unwrap()) -> res => {
+                                    match res {
+                                        Ok(()) => { job_to_send = None; }
+                                        Err(_) => {
+                                            return Err(Error::Internal("Workers disconnected".to_string()));
+                                        }
                                     }
                                 }
-                            }
-                            recv(result_rx) -> res => {
-                                match res {
-                                    Ok(result) => {
-                                        let block = result?;
-                                        Self::buffer_and_write_block(
-                                            &mut writer,
-                                            block,
-                                            &mut pending_blocks,
-                                            &mut next_write_id,
-                                            &mut blocks_written,
-                                            &mut output_bytes,
-                                        )?;
-                                    }
-                                    Err(_) => {
-                                        return Err(Error::Internal(
-                                            "Result channel disconnected".to_string(),
-                                        ));
+                                recv(result_rx) -> res => {
+                                    match res {
+                                        Ok(result) => {
+                                            let block = result?;
+                                            Self::buffer_and_write_block(
+                                                &mut writer,
+                                                block,
+                                                &mut pending_blocks,
+                                                &mut next_write_id,
+                                                &mut blocks_written,
+                                                &mut output_bytes,
+                                            )?;
+                                        }
+                                        Err(_) => {
+                                            return Err(Error::Internal(
+                                                "Result channel disconnected".to_string(),
+                                            ));
+                                        }
                                     }
                                 }
                             }
                         }
+
+                        block_start_position = resolver.position();
+                        pending_tokens.clear();
+                        pending_uncompressed_size = 0;
                     }
 
-                    block_start_position = resolver.position();
-                    pending_tokens.clear();
-                    pending_uncompressed_size = 0;
+                    pending_tokens.push(token.clone());
+                    pending_uncompressed_size += token_size;
                 }
-
-                pending_tokens.push(token.clone());
-                pending_uncompressed_size += token_size;
             }
+
+            // Check for another gzip member
+            if !parser.read_trailer_and_check_next()? {
+                break; // No more members, we're done
+            }
+            // Continue with next member - parser state has been reset
         }
 
         // Flush remaining tokens

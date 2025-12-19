@@ -659,6 +659,74 @@ fn test_input_compression_level_9() {
 }
 
 // ============================================================================
+// Concatenated Gzip Tests
+// ============================================================================
+
+#[test]
+fn test_concatenated_gzip_single_threaded() {
+    // Create three separate gzip streams and concatenate them
+    let data1 = generate_mixed_data(50_000);
+    let data2 = generate_random_data(30_000, 42);
+    let data3 = generate_repetitive_data(40_000);
+
+    let gzip1 = compress_to_gzip(&data1);
+    let gzip2 = compress_to_gzip(&data2);
+    let gzip3 = compress_to_gzip(&data3);
+
+    // Concatenate the gzip streams
+    let mut concat_gzip = Vec::new();
+    concat_gzip.extend_from_slice(&gzip1);
+    concat_gzip.extend_from_slice(&gzip2);
+    concat_gzip.extend_from_slice(&gzip3);
+
+    // Transcode
+    let config = TranscodeConfig::default();
+    let mut transcoder = SingleThreadedTranscoder::new(config);
+    let mut output = Vec::new();
+    let stats = transcoder.transcode(Cursor::new(&concat_gzip), &mut output).unwrap();
+
+    // Verify output is valid BGZF
+    assert!(verify_bgzf_format(&output));
+
+    // Verify decompressed content matches all three inputs concatenated
+    let expected: Vec<u8> = [data1, data2, data3].concat();
+    assert_eq!(decompress_gzip(&output), expected);
+
+    // Verify we processed more than just the first member
+    assert!(stats.input_bytes > gzip1.len() as u64);
+}
+
+#[test]
+fn test_concatenated_gzip_parallel() {
+    // Create two separate gzip streams
+    let data1 = generate_fastq_data(500, 100);
+    let data2 = generate_mixed_data(60_000);
+
+    let gzip1 = compress_to_gzip(&data1);
+    let gzip2 = compress_to_gzip(&data2);
+
+    // Concatenate
+    let mut concat_gzip = Vec::new();
+    concat_gzip.extend_from_slice(&gzip1);
+    concat_gzip.extend_from_slice(&gzip2);
+
+    // Transcode with 2 threads
+    let config = TranscodeConfig { num_threads: 2, ..Default::default() };
+    let mut transcoder = ParallelTranscoder::new(config);
+    let mut output = Vec::new();
+    let stats = transcoder.transcode(Cursor::new(&concat_gzip), &mut output).unwrap();
+
+    // Verify output
+    assert!(verify_bgzf_format(&output));
+
+    let expected: Vec<u8> = [data1, data2].concat();
+    assert_eq!(decompress_gzip(&output), expected);
+
+    // Verify we processed both members
+    assert!(stats.input_bytes > gzip1.len() as u64);
+}
+
+// ============================================================================
 // Binary CLI Tests (if binary is built)
 // ============================================================================
 

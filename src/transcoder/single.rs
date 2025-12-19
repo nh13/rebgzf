@@ -26,7 +26,7 @@ impl Transcoder for SingleThreadedTranscoder {
         let mut reader = BufReader::with_capacity(self.config.buffer_size, input);
         let mut writer = BufWriter::with_capacity(self.config.buffer_size, output);
 
-        // Phase 1: Parse gzip header
+        // Phase 1: Parse first gzip header
         let _gzip_header = GzipHeader::parse(&mut reader)?;
 
         // Phase 2: Initialize components
@@ -40,49 +40,54 @@ impl Transcoder for SingleThreadedTranscoder {
         let mut pending_uncompressed_size: usize = 0;
         let mut block_start_position: u64 = 0;
 
-        // For collecting uncompressed data for CRC (reserved for future use)
-        let _uncompressed_collector = SlidingWindow::new();
-        let _block_uncompressed: Vec<u8> = Vec::with_capacity(self.config.block_size);
-
         // Statistics
         let mut stats = TranscodeStats::default();
 
-        // Phase 3: Main transcoding loop
-        while let Some(deflate_block) = parser.parse_block()? {
-            // Process each token from the DEFLATE block
-            for token in deflate_block.tokens.iter() {
-                // Skip EndOfBlock tokens from input
-                if matches!(token, LZ77Token::EndOfBlock) {
-                    continue;
+        // Phase 3: Main transcoding loop - handles multiple gzip members
+        loop {
+            // Process all DEFLATE blocks in current gzip member
+            while let Some(deflate_block) = parser.parse_block()? {
+                // Process each token from the DEFLATE block
+                for token in deflate_block.tokens.iter() {
+                    // Skip EndOfBlock tokens from input
+                    if matches!(token, LZ77Token::EndOfBlock) {
+                        continue;
+                    }
+
+                    let token_size = token.uncompressed_size();
+
+                    // Check if adding this token would exceed BGZF block size
+                    if pending_uncompressed_size + token_size > self.config.block_size
+                        && !pending_tokens.is_empty()
+                    {
+                        // Emit current BGZF block
+                        self.emit_block(
+                            &mut resolver,
+                            &mut encoder,
+                            &mut bgzf_writer,
+                            &pending_tokens,
+                            block_start_position,
+                            &mut stats,
+                        )?;
+
+                        block_start_position = resolver.position();
+                        pending_tokens.clear();
+                        pending_uncompressed_size = 0;
+                    }
+
+                    // Add token to pending
+                    pending_tokens.push(token.clone());
+                    pending_uncompressed_size += token_size;
                 }
-
-                let token_size = token.uncompressed_size();
-
-                // Check if adding this token would exceed BGZF block size
-                if pending_uncompressed_size + token_size > self.config.block_size
-                    && !pending_tokens.is_empty()
-                {
-                    // Emit current BGZF block
-                    self.emit_block(
-                        &mut resolver,
-                        &mut encoder,
-                        &mut bgzf_writer,
-                        &pending_tokens,
-                        block_start_position,
-                        &mut stats,
-                    )?;
-
-                    block_start_position = resolver.position();
-                    pending_tokens.clear();
-                    pending_uncompressed_size = 0;
-                }
-
-                // Add token to pending
-                pending_tokens.push(token.clone());
-                pending_uncompressed_size += token_size;
             }
 
             stats.input_bytes = parser.bytes_read();
+
+            // Check for another gzip member
+            if !parser.read_trailer_and_check_next()? {
+                break; // No more members, we're done
+            }
+            // Continue with next member - parser state has been reset
         }
 
         // Phase 5: Flush remaining tokens
