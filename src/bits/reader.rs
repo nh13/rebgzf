@@ -21,9 +21,48 @@ impl<R: Read> BitReader<R> {
     }
 
     /// Ensure at least `n` bits are available in buffer
+    ///
+    /// Uses bulk refill: reads up to 8 bytes at once when buffer is low,
+    /// reducing syscall overhead significantly for bit-level operations.
     fn fill_buffer(&mut self, n: u8) -> Result<()> {
         debug_assert!(n <= 57, "Cannot request more than 57 bits at once");
 
+        // Fast path: already have enough bits
+        if self.bits_available >= n {
+            return Ok(());
+        }
+
+        // Bulk refill: read up to 8 bytes at once when buffer has room
+        // We can safely add bytes when bits_available <= 56 (room for 8 bits minimum)
+        if self.bits_available <= 56 {
+            let bytes_to_read = ((64 - self.bits_available) / 8) as usize;
+            let mut bulk_buf = [0u8; 8];
+
+            match self.reader.read(&mut bulk_buf[..bytes_to_read]) {
+                Ok(0) => {
+                    // No bytes available - fall through to byte-by-byte for EOF handling
+                }
+                Ok(bytes_read) => {
+                    // Add all read bytes to buffer at once
+                    for &byte in &bulk_buf[..bytes_read] {
+                        self.buffer |= (byte as u64) << self.bits_available;
+                        self.bits_available += 8;
+                    }
+                    self.bytes_read += bytes_read as u64;
+
+                    // If we now have enough, we're done
+                    if self.bits_available >= n {
+                        return Ok(());
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                    // Retry on interrupt
+                }
+                Err(e) => return Err(Error::Io(e)),
+            }
+        }
+
+        // Fallback: byte-by-byte for remaining needs or EOF detection
         while self.bits_available < n {
             let mut byte = [0u8; 1];
             match self.reader.read_exact(&mut byte) {

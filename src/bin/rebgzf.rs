@@ -1,7 +1,10 @@
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use rebgzf::{
@@ -74,12 +77,116 @@ struct Args {
     /// Force transcoding even if input is already BGZF
     #[arg(long)]
     force: bool,
+
+    /// Show progress during transcoding (throughput display)
+    #[arg(short = 'p', long)]
+    progress: bool,
 }
 
 /// Exit codes for --check mode
 const EXIT_IS_BGZF: u8 = 0;
 const EXIT_NOT_BGZF: u8 = 1;
 const EXIT_ERROR: u8 = 2;
+
+/// Progress tracking state shared between reader wrapper and progress thread
+struct ProgressState {
+    bytes_read: AtomicU64,
+    total_size: Option<u64>,
+    done: AtomicBool,
+}
+
+/// Reader wrapper that tracks bytes read for progress reporting
+struct ProgressReader<R: Read> {
+    inner: R,
+    state: Arc<ProgressState>,
+}
+
+impl<R: Read> ProgressReader<R> {
+    fn new(inner: R, state: Arc<ProgressState>) -> Self {
+        Self { inner, state }
+    }
+}
+
+impl<R: Read> Read for ProgressReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.state.bytes_read.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+/// Format bytes as human-readable string
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+/// Spawn progress display thread
+fn spawn_progress_thread(state: Arc<ProgressState>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let start = Instant::now();
+        let mut last_bytes = 0u64;
+        let mut last_time = start;
+
+        while !state.done.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(500));
+
+            let bytes = state.bytes_read.load(Ordering::Relaxed);
+            let now = Instant::now();
+            let elapsed = now.duration_since(start);
+            let delta_bytes = bytes.saturating_sub(last_bytes);
+            let delta_time = now.duration_since(last_time);
+
+            // Calculate throughput
+            let throughput = if delta_time.as_secs_f64() > 0.0 {
+                delta_bytes as f64 / delta_time.as_secs_f64() / 1_000_000.0
+            } else {
+                0.0
+            };
+
+            // Build progress line
+            let progress_str = if let Some(total) = state.total_size {
+                let pct = (bytes as f64 / total as f64 * 100.0).min(100.0);
+                format!(
+                    "\r{} / {} ({:.1}%) - {:.1} MB/s - {:.1}s elapsed",
+                    format_bytes(bytes),
+                    format_bytes(total),
+                    pct,
+                    throughput,
+                    elapsed.as_secs_f64()
+                )
+            } else {
+                format!(
+                    "\r{} - {:.1} MB/s - {:.1}s elapsed",
+                    format_bytes(bytes),
+                    throughput,
+                    elapsed.as_secs_f64()
+                )
+            };
+
+            eprint!("{:<60}", progress_str);
+            let _ = io::stderr().flush();
+
+            last_bytes = bytes;
+            last_time = now;
+        }
+
+        // Clear progress line
+        eprint!("\r{:<60}\r", "");
+        let _ = io::stderr().flush();
+    })
+}
 
 fn main() -> ExitCode {
     match run() {
@@ -179,11 +286,39 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
         drop(file);
     }
 
-    // Open input for transcoding
-    let input: Box<dyn Read> = if is_stdin {
-        Box::new(io::stdin().lock())
+    // Get total file size for progress display (if not stdin)
+    let total_size =
+        if !is_stdin { std::fs::metadata(&args.input).ok().map(|m| m.len()) } else { None };
+
+    // Set up progress tracking if enabled
+    let progress_state = if args.progress {
+        Some(Arc::new(ProgressState {
+            bytes_read: AtomicU64::new(0),
+            total_size,
+            done: AtomicBool::new(false),
+        }))
     } else {
-        Box::new(BufReader::new(File::open(&args.input)?))
+        None
+    };
+
+    // Spawn progress thread if enabled
+    let progress_handle =
+        progress_state.as_ref().map(|state| spawn_progress_thread(Arc::clone(state)));
+
+    // Open input for transcoding (with optional progress wrapper)
+    let input: Box<dyn Read> = if is_stdin {
+        if let Some(ref state) = progress_state {
+            Box::new(ProgressReader::new(io::stdin().lock(), Arc::clone(state)))
+        } else {
+            Box::new(io::stdin().lock())
+        }
+    } else {
+        let file = BufReader::new(File::open(&args.input)?);
+        if let Some(ref state) = progress_state {
+            Box::new(ProgressReader::new(file, Arc::clone(state)))
+        } else {
+            Box::new(file)
+        }
     };
 
     // Open output
@@ -206,7 +341,15 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
 
     let elapsed = start.elapsed();
 
-    if args.verbose {
+    // Signal progress thread to stop and wait for it
+    if let Some(ref state) = progress_state {
+        state.done.store(true, Ordering::Relaxed);
+    }
+    if let Some(handle) = progress_handle {
+        let _ = handle.join();
+    }
+
+    if args.verbose || args.progress {
         eprintln!("Transcoding complete:");
         eprintln!("  Input bytes:      {}", stats.input_bytes);
         eprintln!("  Output bytes:     {}", stats.output_bytes);
