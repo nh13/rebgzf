@@ -1,5 +1,4 @@
 use super::boundary::BoundaryResolver;
-use super::window::SlidingWindow;
 use crate::bgzf::BgzfBlockWriter;
 use crate::deflate::{DeflateParser, LZ77Token};
 use crate::error::Result;
@@ -126,17 +125,14 @@ impl SingleThreadedTranscoder {
         block_start: u64,
         stats: &mut TranscodeStats,
     ) -> Result<()> {
-        // Resolve cross-boundary references
-        let resolved = resolver.resolve_block(block_start, tokens);
-
-        // Collect uncompressed data for CRC
-        let uncompressed = collect_uncompressed(&resolved);
+        // Resolve cross-boundary references (also computes CRC)
+        let (resolved, crc, uncompressed_size) = resolver.resolve_block(block_start, tokens);
 
         // Encode to DEFLATE (is_final = true for each BGZF block)
         let deflate_data = encoder.encode(&resolved, true)?;
 
-        // Write BGZF block
-        bgzf_writer.write_block(&deflate_data, &uncompressed)?;
+        // Write BGZF block with pre-computed CRC
+        bgzf_writer.write_block_with_crc(&deflate_data, crc, uncompressed_size)?;
 
         // Update stats
         stats.blocks_written += 1;
@@ -144,31 +140,6 @@ impl SingleThreadedTranscoder {
 
         Ok(())
     }
-}
-
-/// Collect uncompressed bytes from resolved tokens (needed for CRC)
-fn collect_uncompressed(tokens: &[LZ77Token]) -> Vec<u8> {
-    let mut result = Vec::new();
-    let mut window = SlidingWindow::new();
-
-    for token in tokens {
-        match token {
-            LZ77Token::Literal(byte) => {
-                result.push(*byte);
-                window.push_byte(*byte);
-            }
-            LZ77Token::Copy { length, distance } => {
-                let bytes = window.get(*distance, *length);
-                for byte in &bytes {
-                    result.push(*byte);
-                    window.push_byte(*byte);
-                }
-            }
-            LZ77Token::EndOfBlock => {}
-        }
-    }
-
-    result
 }
 
 #[cfg(test)]

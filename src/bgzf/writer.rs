@@ -12,16 +12,13 @@ impl<W: Write> BgzfBlockWriter<W> {
         Self { writer }
     }
 
-    /// Write a BGZF block with pre-encoded deflate data
-    pub fn write_block(&mut self, deflate_data: &[u8], uncompressed: &[u8]) -> Result<()> {
+    /// Write a BGZF block with pre-encoded deflate data and pre-computed CRC
+    pub fn write_block_with_crc(&mut self, deflate_data: &[u8], crc: u32, isize: u32) -> Result<()> {
         let block_size = BGZF_HEADER_SIZE + deflate_data.len() + BGZF_FOOTER_SIZE;
 
         if block_size > MAX_BGZF_BLOCK_SIZE {
             return Err(Error::BgzfBlockTooLarge { size: block_size, max: MAX_BGZF_BLOCK_SIZE });
         }
-
-        // Calculate CRC32
-        let crc = crc32fast::hash(uncompressed);
 
         // Write BGZF header
         self.write_header(block_size - 1)?; // BSIZE is block_size - 1
@@ -31,9 +28,15 @@ impl<W: Write> BgzfBlockWriter<W> {
 
         // Write footer: CRC32 + ISIZE
         self.writer.write_all(&crc.to_le_bytes())?;
-        self.writer.write_all(&(uncompressed.len() as u32).to_le_bytes())?;
+        self.writer.write_all(&isize.to_le_bytes())?;
 
         Ok(())
+    }
+
+    /// Write a BGZF block with pre-encoded deflate data (computes CRC internally)
+    pub fn write_block(&mut self, deflate_data: &[u8], uncompressed: &[u8]) -> Result<()> {
+        let crc = crc32fast::hash(uncompressed);
+        self.write_block_with_crc(deflate_data, crc, uncompressed.len() as u32)
     }
 
     /// Write the BGZF header (18 bytes)

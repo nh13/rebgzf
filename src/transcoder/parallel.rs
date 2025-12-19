@@ -11,7 +11,6 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use crossbeam::channel::{bounded, Receiver, Sender};
 
 use super::boundary::BoundaryResolver;
-use super::window::SlidingWindow;
 use crate::bgzf::BGZF_EOF;
 use crate::deflate::{DeflateParser, LZ77Token};
 use crate::error::{Error, Result};
@@ -25,6 +24,10 @@ struct EncodingJob {
     block_id: u64,
     /// Resolved LZ77 tokens for this block
     tokens: Vec<LZ77Token>,
+    /// Pre-computed CRC32 of uncompressed data
+    crc: u32,
+    /// Uncompressed size
+    uncompressed_size: u32,
 }
 
 /// Result of encoding a single BGZF block
@@ -156,10 +159,10 @@ impl ParallelTranscoder {
                     if pending_uncompressed_size + token_size > self.config.block_size
                         && !pending_tokens.is_empty()
                     {
-                        // Resolve boundaries and send job
-                        let resolved = resolver.resolve_block(block_start_position, &pending_tokens);
+                        // Resolve boundaries and send job (includes CRC computation)
+                        let (resolved, crc, uncompressed_size) = resolver.resolve_block(block_start_position, &pending_tokens);
 
-                        let job = EncodingJob { block_id: next_block_id, tokens: resolved };
+                        let job = EncodingJob { block_id: next_block_id, tokens: resolved, crc, uncompressed_size };
                         next_block_id += 1;
 
                         // Send job, draining results as needed to prevent deadlock
@@ -216,9 +219,9 @@ impl ParallelTranscoder {
 
         // Flush remaining tokens
         if !pending_tokens.is_empty() {
-            let resolved = resolver.resolve_block(block_start_position, &pending_tokens);
+            let (resolved, crc, uncompressed_size) = resolver.resolve_block(block_start_position, &pending_tokens);
 
-            let job = EncodingJob { block_id: next_block_id, tokens: resolved };
+            let job = EncodingJob { block_id: next_block_id, tokens: resolved, crc, uncompressed_size };
             next_block_id += 1;
 
             let _ = job_tx.send(job);
@@ -303,7 +306,12 @@ impl ParallelTranscoder {
 // Need Clone for EncodingJob to handle retry in try_send
 impl Clone for EncodingJob {
     fn clone(&self) -> Self {
-        Self { block_id: self.block_id, tokens: self.tokens.clone() }
+        Self {
+            block_id: self.block_id,
+            tokens: self.tokens.clone(),
+            crc: self.crc,
+            uncompressed_size: self.uncompressed_size,
+        }
     }
 }
 
@@ -327,9 +335,6 @@ fn worker_thread(
 
 /// Encode a single BGZF block
 fn encode_block(encoder: &mut HuffmanEncoder, job: EncodingJob) -> Result<EncodedBlock> {
-    // Collect uncompressed data for CRC
-    let uncompressed = collect_uncompressed(&job.tokens);
-
     // Encode to DEFLATE
     let deflate_data = encoder.encode(&job.tokens, true)?;
 
@@ -337,7 +342,9 @@ fn encode_block(encoder: &mut HuffmanEncoder, job: EncodingJob) -> Result<Encode
     let block_size = 18 + deflate_data.len() + 8; // header + deflate + footer
     let bsize = block_size - 1;
 
-    let crc = crc32fast::hash(&uncompressed);
+    // Use pre-computed CRC and size
+    let crc = job.crc;
+    let isize = job.uncompressed_size;
 
     let mut data = Vec::with_capacity(block_size);
 
@@ -368,35 +375,11 @@ fn encode_block(encoder: &mut HuffmanEncoder, job: EncodingJob) -> Result<Encode
 
     // Footer: CRC32 + ISIZE
     data.extend_from_slice(&crc.to_le_bytes());
-    data.extend_from_slice(&(uncompressed.len() as u32).to_le_bytes());
+    data.extend_from_slice(&isize.to_le_bytes());
 
     Ok(EncodedBlock { block_id: job.block_id, data })
 }
 
-/// Collect uncompressed bytes from resolved tokens (needed for CRC)
-fn collect_uncompressed(tokens: &[LZ77Token]) -> Vec<u8> {
-    let mut result = Vec::new();
-    let mut window = SlidingWindow::new();
-
-    for token in tokens {
-        match token {
-            LZ77Token::Literal(byte) => {
-                result.push(*byte);
-                window.push_byte(*byte);
-            }
-            LZ77Token::Copy { length, distance } => {
-                let bytes = window.get(*distance, *length);
-                for byte in &bytes {
-                    result.push(*byte);
-                    window.push_byte(*byte);
-                }
-            }
-            LZ77Token::EndOfBlock => {}
-        }
-    }
-
-    result
-}
 
 #[cfg(test)]
 mod tests {

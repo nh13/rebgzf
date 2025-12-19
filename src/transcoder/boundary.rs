@@ -26,9 +26,11 @@ impl BoundaryResolver {
     /// `block_start`: position where this BGZF block starts
     /// `tokens`: LZ77 tokens to process
     ///
-    /// Returns: tokens with cross-boundary references resolved to literals
-    pub fn resolve_block(&mut self, block_start: u64, tokens: &[LZ77Token]) -> Vec<LZ77Token> {
+    /// Returns: (tokens with cross-boundary references resolved, CRC32, uncompressed size)
+    pub fn resolve_block(&mut self, block_start: u64, tokens: &[LZ77Token]) -> (Vec<LZ77Token>, u32, u32) {
         let mut output = Vec::with_capacity(tokens.len());
+        let mut hasher = crc32fast::Hasher::new();
+        let mut uncompressed_size: u32 = 0;
 
         for token in tokens {
             match token {
@@ -37,6 +39,8 @@ impl BoundaryResolver {
                     self.window.push_byte(*byte);
                     self.position += 1;
                     output.push(LZ77Token::Literal(*byte));
+                    hasher.update(&[*byte]);
+                    uncompressed_size += 1;
                 }
 
                 LZ77Token::Copy { length, distance } => {
@@ -50,15 +54,19 @@ impl BoundaryResolver {
                             self.window.push_byte(*byte);
                             output.push(LZ77Token::Literal(*byte));
                         }
+                        hasher.update(&resolved);
+                        uncompressed_size += *length as u32;
                         self.position += *length as u64;
                         self.refs_resolved += 1;
                     } else {
                         // Reference stays within current block - preserve it
-                        // But we still need to update the window!
+                        // But we still need to update the window and compute CRC
                         let resolved = self.resolve_copy(*length, *distance);
                         for byte in &resolved {
                             self.window.push_byte(*byte);
                         }
+                        hasher.update(&resolved);
+                        uncompressed_size += *length as u32;
                         self.position += *length as u64;
                         output.push(LZ77Token::Copy { length: *length, distance: *distance });
                         self.refs_preserved += 1;
@@ -71,7 +79,7 @@ impl BoundaryResolver {
             }
         }
 
-        output
+        (output, hasher.finalize(), uncompressed_size)
     }
 
     /// Resolve a Copy reference to literal bytes using the window
@@ -113,12 +121,14 @@ mod tests {
         let mut resolver = BoundaryResolver::new();
 
         let tokens = vec![LZ77Token::Literal(b'H'), LZ77Token::Literal(b'i')];
-        let resolved = resolver.resolve_block(0, &tokens);
+        let (resolved, crc, size) = resolver.resolve_block(0, &tokens);
 
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0], LZ77Token::Literal(b'H'));
         assert_eq!(resolved[1], LZ77Token::Literal(b'i'));
         assert_eq!(resolver.position(), 2);
+        assert_eq!(size, 2);
+        assert_eq!(crc, crc32fast::hash(b"Hi"));
     }
 
     #[test]
@@ -131,11 +141,13 @@ mod tests {
             LZ77Token::Literal(b'B'),
             LZ77Token::Copy { length: 2, distance: 2 }, // Copy "AB"
         ];
-        let resolved = resolver.resolve_block(0, &tokens);
+        let (resolved, crc, size) = resolver.resolve_block(0, &tokens);
 
         // Copy should be preserved since it references within block
         assert_eq!(resolved.len(), 3);
         assert!(matches!(resolved[2], LZ77Token::Copy { .. }));
+        assert_eq!(size, 4);
+        assert_eq!(crc, crc32fast::hash(b"ABAB"));
 
         let (refs_resolved, refs_preserved) = resolver.stats();
         assert_eq!(refs_resolved, 0);
@@ -153,8 +165,10 @@ mod tests {
             LZ77Token::Literal(b'C'),
             LZ77Token::Literal(b'D'),
         ];
-        let _ = resolver.resolve_block(0, &tokens1);
+        let (_, crc1, size1) = resolver.resolve_block(0, &tokens1);
         assert_eq!(resolver.position(), 4);
+        assert_eq!(size1, 4);
+        assert_eq!(crc1, crc32fast::hash(b"ABCD"));
 
         // Second block starting at position 4
         // Contains a reference back to first block
@@ -162,13 +176,15 @@ mod tests {
             LZ77Token::Literal(b'E'),
             LZ77Token::Copy { length: 2, distance: 5 }, // refs "AB" in block 1
         ];
-        let resolved = resolver.resolve_block(4, &tokens2);
+        let (resolved, crc2, size2) = resolver.resolve_block(4, &tokens2);
 
         // Copy should be resolved to literals since it references previous block
         assert_eq!(resolved.len(), 3);
         assert_eq!(resolved[0], LZ77Token::Literal(b'E'));
         assert_eq!(resolved[1], LZ77Token::Literal(b'A'));
         assert_eq!(resolved[2], LZ77Token::Literal(b'B'));
+        assert_eq!(size2, 3);
+        assert_eq!(crc2, crc32fast::hash(b"EAB"));
 
         let (refs_resolved, refs_preserved) = resolver.stats();
         assert_eq!(refs_resolved, 1);
@@ -194,7 +210,7 @@ mod tests {
             LZ77Token::Copy { length: 2, distance: 5 }, // refs block 1 -> resolve
             LZ77Token::Copy { length: 2, distance: 1 }, // refs within block 2 -> preserve
         ];
-        let resolved = resolver.resolve_block(4, &tokens2);
+        let (resolved, crc, size) = resolver.resolve_block(4, &tokens2);
 
         // Should have: E, A, B, Copy(2,1)
         assert_eq!(resolved.len(), 4);
@@ -202,5 +218,7 @@ mod tests {
         assert_eq!(resolved[1], LZ77Token::Literal(b'A'));
         assert_eq!(resolved[2], LZ77Token::Literal(b'B'));
         assert!(matches!(resolved[3], LZ77Token::Copy { length: 2, distance: 1 }));
+        assert_eq!(size, 5);
+        assert_eq!(crc, crc32fast::hash(b"EABBB")); // E + AB + BB (copy of last B twice)
     }
 }
