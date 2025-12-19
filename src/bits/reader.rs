@@ -59,6 +59,29 @@ impl<R: Read> BitReader<R> {
         Ok(result)
     }
 
+    /// Peek at `n` bits without consuming them (for table-based Huffman decoding)
+    #[inline]
+    pub fn peek_bits(&mut self, n: u8) -> Result<u32> {
+        debug_assert!(n <= 32, "Cannot peek more than 32 bits at once");
+
+        if n == 0 {
+            return Ok(0);
+        }
+
+        self.fill_buffer(n)?;
+
+        let mask = (1u64 << n) - 1;
+        Ok((self.buffer & mask) as u32)
+    }
+
+    /// Consume `n` bits that were previously peeked
+    #[inline]
+    pub fn consume_bits(&mut self, n: u8) {
+        debug_assert!(n <= self.bits_available, "Cannot consume more bits than available");
+        self.buffer >>= n;
+        self.bits_available -= n;
+    }
+
     /// Read a single bit
     #[inline]
     pub fn read_bit(&mut self) -> Result<bool> {

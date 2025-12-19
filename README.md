@@ -26,27 +26,34 @@ This avoids the expensive compression step entirely - we're just re-serializing 
 
 ### Performance
 
-Half-decompression can be faster than full decompress + recompress because:
+Half-decompression is significantly faster than full decompress + recompress because:
 - No dictionary lookups for compression
 - No hash table maintenance
 - Minimal memory footprint (just the sliding window)
 - Parallel encoding of independent blocks
 
+**Benchmark Results** (57 MB gzip → 208 MB uncompressed FASTQ):
+
+| Threads | Time  | Throughput  | Speedup |
+|---------|-------|-------------|---------|
+| 1       | 2.92s | 19.6 MB/s   | 1.0x    |
+| 2       | 1.76s | 32.4 MB/s   | 1.66x   |
+| 4       | 1.79s | 32.0 MB/s   | 1.63x   |
+| 8       | 1.78s | 32.2 MB/s   | 1.64x   |
+
+*Throughput measured on compressed input size. Tested on Apple M1.*
+
+**Why only 2 threads help:**
+
+The tool uses a producer-consumer architecture where the main thread sequentially parses DEFLATE blocks (this cannot be parallelized) while worker threads encode BGZF blocks in parallel. With 2 threads total:
+- Main thread: parses DEFLATE, resolves cross-boundary references
+- Worker thread: encodes tokens to BGZF, computes CRC32
+
+Additional threads beyond 2 provide **no benefit** because the main thread's sequential parsing is the bottleneck. The single worker can easily keep up with the parsing rate.
+
 **Trade-offs:**
 - Fixed Huffman encoding (default) is faster but produces larger output (~30% larger)
-- DEFLATE parsing is sequential, limiting parallel speedup
-- Best suited for format conversion rather than optimal compression
-
-**Benchmark Results** (50MB uncompressed, 38MB gzip input):
-
-| Threads | Time    | Throughput | Speedup |
-|---------|---------|------------|---------|
-| 1       | 1.71s   | 23.3 MB/s  | 1.0x    |
-| 2       | 1.38s   | 28.7 MB/s  | 1.24x   |
-| 4       | 1.39s   | 28.6 MB/s  | 1.23x   |
-| 8       | 1.38s   | 28.7 MB/s  | 1.24x   |
-
-*Note: Parallel scaling is limited because DEFLATE parsing is inherently sequential. Multi-threading accelerates only the Huffman re-encoding stage.*
+- Best suited for format conversion pipelines where random access is needed
 
 ## Installation
 
@@ -190,6 +197,35 @@ Tokens are re-encoded using:
 - **Fixed Huffman tables** (default): Faster encoding, slightly larger output
 - **Dynamic Huffman tables**: Better compression, slower encoding
 
+## Optimization Techniques
+
+### Table-Based Huffman Decoding
+
+Standard Huffman decoding reads one bit at a time, requiring multiple loop iterations per symbol. We use a **lookup table approach**:
+
+1. Build a 1024-entry table (10-bit lookup) at decoder construction time
+2. Peek 10 bits from the bitstream
+3. Single table lookup returns both the symbol and its actual code length
+4. Consume only the actual code length bits
+
+This reduces most symbol decodes from ~9 loop iterations to a single table lookup, providing a **~30% speedup** in parsing.
+
+### Conditional CRC Computation
+
+CRC32 computation is handled differently based on thread count:
+
+- **Single-threaded**: CRC computed inline during boundary resolution (cache-efficient, no duplicate work)
+- **Multi-threaded**: Workers compute CRC in parallel by replaying tokens to bytes
+
+This avoids adding sequential work to the main thread in parallel mode.
+
+### Hardware-Accelerated CRC32
+
+Uses the `crc32fast` crate which automatically leverages:
+- SSE4.2 CRC instructions on x86_64
+- ARM CRC instructions on aarch64
+- Optimized software fallback on other platforms
+
 ## Architecture
 
 ```
@@ -209,6 +245,7 @@ Tokens are re-encoded using:
 │  DEFLATE Parser (DeflateParser)                             │
 │  - Parses block headers (BFINAL, BTYPE)                     │
 │  - Decodes Huffman tables (fixed or dynamic)                │
+│  - Uses table-based lookup for fast symbol decoding         │
 │  - Extracts LZ77 tokens: Literal(u8), Copy{len, dist}       │
 └─────────────────────────────────────────────────────────────┘
                               │
@@ -246,14 +283,11 @@ Tokens are re-encoded using:
 
 For multi-threaded transcoding, we use a producer-consumer pipeline:
 
-1. **Main thread (Producer)**: Parses DEFLATE, accumulates tokens, resolves boundaries
-2. **Worker pool (Consumers)**: Encode tokens to BGZF blocks in parallel
+1. **Main thread (Producer)**: Parses DEFLATE, accumulates tokens, resolves cross-boundary references
+2. **Worker pool (Consumers)**: Replay tokens to bytes, compute CRC32, encode to BGZF blocks
 3. **Output assembly**: Blocks are reassembled in order using sequence numbers
 
-This achieves good parallelism because:
-- Boundary resolution must be sequential (maintains sliding window state)
-- Encoding is CPU-intensive and embarrassingly parallel
-- Blocks are independent after boundary resolution
+The main thread is the bottleneck because DEFLATE parsing is inherently sequential (Huffman codes are variable-length and context-dependent). In practice, **2 threads is optimal**: one for parsing, one for encoding. Additional workers have nothing to do.
 
 ## Benchmarks
 
