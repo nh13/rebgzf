@@ -1,0 +1,53 @@
+{% set name = "rebgzf" %}
+{% set version = "0.1.0" %}
+
+package:
+  name: {{ name }}
+  version: {{ version }}
+
+source:
+  url: https://github.com/nh13/{{ name }}/archive/refs/tags/v{{ version }}.tar.gz
+  sha256: REPLACE_WITH_SHA256
+
+build:
+  number: 0
+  run_exports:
+    - {{ pin_subpackage(name, max_pin="x.x") }}
+
+requirements:
+  build:
+    - {{ compiler('c') }}
+    - {{ compiler('rust') }}
+    - cargo-bundle-licenses
+  host:
+  run:
+
+test:
+  commands:
+    - rebgzf --help
+    - rebgzf --version
+    # Basic functionality test
+    - echo "test" | gzip > test.gz && rebgzf -i test.gz -o test.bgz && rebgzf --check -i test.bgz
+
+about:
+  home: https://github.com/nh13/rebgzf
+  license: MIT
+  license_family: MIT
+  license_file: LICENSE
+  summary: Efficient gzip to BGZF transcoder using half-decompression
+  description: |
+    rebgzf converts standard gzip files to BGZF format efficiently using
+    a Puffin-style half-decompression technique. Instead of fully decompressing
+    and recompressing, it extracts LZ77 tokens and re-encodes them directly
+    into BGZF blocks, achieving 2-4x speedup over traditional methods.
+
+    BGZF (Blocked GNU Zip Format) is widely used in bioinformatics for
+    BAM, CRAM, and VCF files to enable random access to compressed data.
+  dev_url: https://github.com/nh13/rebgzf
+  doc_url: https://github.com/nh13/rebgzf
+
+extra:
+  recipe-maintainers:
+    - nh13
+  identifiers:
+    - biotools:rebgzf

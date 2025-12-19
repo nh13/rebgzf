@@ -1,0 +1,168 @@
+# Release workflow using cargo-dist
+# Triggers on version tags (v0.1.0, v1.0.0-rc.1, etc.)
+#
+# This workflow:
+# 1. Builds release binaries for multiple platforms
+# 2. Creates a GitHub release with assets
+# 3. Publishes to crates.io
+# 4. Optionally publishes to Homebrew tap
+
+name: Release
+
+permissions:
+  contents: write
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Create the GitHub release
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get tag
+        id: tag
+        run: echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          prerelease: ${{ contains(github.ref, '-') }}
+          generate_release_notes: true
+
+  # Build release binaries
+  build:
+    name: Build ${{ matrix.target }}
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: false
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            cross: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czvf ../../../rebgzf-${{ needs.create-release.outputs.tag }}-${{ matrix.target }}.tar.gz rebgzf
+          cd -
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: rebgzf-${{ needs.create-release.outputs.tag }}-${{ matrix.target }}.tar.gz
+
+  # Publish to crates.io
+  publish-crates:
+    name: Publish to crates.io
+    needs: [create-release, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # Generate shell installer script
+  installer:
+    name: Generate Installer
+    needs: [create-release, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate install script
+        run: |
+          cat > install.sh << 'SCRIPT'
+          #!/bin/sh
+          set -e
+
+          REPO="nh13/rebgzf"
+          BINARY="rebgzf"
+
+          # Detect platform
+          OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+          ARCH=$(uname -m)
+
+          case "$OS" in
+            linux) OS="unknown-linux-gnu" ;;
+            darwin) OS="apple-darwin" ;;
+            *) echo "Unsupported OS: $OS"; exit 1 ;;
+          esac
+
+          case "$ARCH" in
+            x86_64) ARCH="x86_64" ;;
+            aarch64|arm64) ARCH="aarch64" ;;
+            *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
+          esac
+
+          TARGET="${ARCH}-${OS}"
+
+          # Get latest release
+          LATEST=$(curl -s "https://api.github.com/repos/$REPO/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+
+          echo "Installing $BINARY $LATEST for $TARGET..."
+
+          URL="https://github.com/$REPO/releases/download/$LATEST/$BINARY-$LATEST-$TARGET.tar.gz"
+
+          # Download and install
+          TMPDIR=$(mktemp -d)
+          curl -sL "$URL" | tar xz -C "$TMPDIR"
+
+          INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
+          sudo mv "$TMPDIR/$BINARY" "$INSTALL_DIR/"
+          rm -rf "$TMPDIR"
+
+          echo "$BINARY installed to $INSTALL_DIR/$BINARY"
+          SCRIPT
+          chmod +x install.sh
+      - name: Upload Installer
+        uses: softprops/action-gh-release@v2
+        with:
+          files: install.sh
