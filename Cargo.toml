@@ -1,0 +1,81 @@
+[package]
+name = "rebgzf"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Efficient gzip to BGZF transcoder using Puffin-style half-decompression"
+license = "MIT"
+repository = "https://github.com/nh13/rebgzf"
+homepage = "https://github.com/nh13/rebgzf"
+documentation = "https://docs.rs/rebgzf"
+readme = "README.md"
+categories = ["command-line-utilities", "compression"]
+keywords = ["bioinformatics", "gzip", "bgzf", "transcoding", "deflate"]
+
+[lib]
+name = "rebgzf"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rebgzf"
+path = "src/bin/rebgzf.rs"
+
+[dependencies]
+# CRC32 for BGZF footer
+crc32fast = "1.3"
+
+# Parallel processing
+crossbeam = "0.8"
+num_cpus = "1.16"
+
+# Error handling
+thiserror = "1.0"
+
+# CLI
+clap = { version = "4.4", features = ["derive"] }
+
+[dev-dependencies]
+# For testing against reference implementations
+flate2 = "1.0"
+# Use local bgzf for testing (clone from https://github.com/fulcrumgenomics/bgzf)
+# bgzf = { path = "../bgzf" }
+criterion = "0.5"
+
+[[bench]]
+name = "transcode"
+harness = false
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
+# cargo-dist configuration for release binaries
+# Run `cargo dist init` to regenerate CI if needed
+[workspace.metadata.dist]
+# CI backends to generate
+ci = "github"
+# Installers to generate
+installers = ["shell", "homebrew"]
+# Target platforms
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+]
+# Publish jobs to run in CI
+publish-jobs = ["homebrew"]
+# Whether to auto-include files like README, LICENSE
+auto-includes = true
+# Create GitHub releases
+create-release = true
+# GitHub repo for releases
+github-releases-repo = "nh13/rebgzf"
+# Homebrew tap to publish to (create this repo first)
+tap = "nh13/homebrew-tap"
+# Formula name in tap
+formula = "rebgzf"

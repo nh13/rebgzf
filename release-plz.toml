@@ -1,0 +1,18 @@
+# release-plz configuration
+# https://release-plz.ieni.dev
+
+[workspace]
+# Use git-cliff for changelog generation
+changelog_config = "cliff.toml"
+
+# Update dependencies in lockfile
+dependencies_update = true
+
+# Label for release PRs
+pr_labels = ["release"]
+
+# Don't create GitHub releases (let cargo-dist handle that)
+git_release_enable = false
+
+# Commit message for version bumps
+semver_check = true

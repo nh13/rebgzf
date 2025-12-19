@@ -1,0 +1,95 @@
+name: Check and Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  test:
+    name: Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - run: cargo ci-test
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo ci-lint
+
+  format:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo ci-fmt
+
+  integration:
+    name: Integration Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Create test gzip file
+        run: |
+          echo "Hello, BGZF World! This is a test file for rebgzf." > /tmp/test.txt
+          gzip -c /tmp/test.txt > /tmp/test.gz
+
+      - name: Run rebgzf --check on gzip (should exit 1)
+        run: |
+          ! ./target/release/rebgzf --check -i /tmp/test.gz
+          echo "Correctly identified as non-BGZF"
+
+      - name: Convert gzip to BGZF
+        run: |
+          ./target/release/rebgzf -i /tmp/test.gz -o /tmp/test.bgz -v
+
+      - name: Verify output is valid BGZF
+        run: |
+          ./target/release/rebgzf --check -i /tmp/test.bgz
+          echo "Output verified as valid BGZF"
+
+      - name: Verify content integrity
+        run: |
+          gunzip -c /tmp/test.bgz > /tmp/test_out.txt
+          diff /tmp/test.txt /tmp/test_out.txt
+          echo "Content integrity verified"
+
+      - name: Test parallel transcoding
+        run: |
+          # Create larger test file
+          for i in $(seq 1 10000); do echo "Line $i: ACGTACGTACGT"; done > /tmp/large.txt
+          gzip -c /tmp/large.txt > /tmp/large.gz
+          ./target/release/rebgzf -i /tmp/large.gz -o /tmp/large.bgz -t 0 -v
+          gunzip -c /tmp/large.bgz > /tmp/large_out.txt
+          diff /tmp/large.txt /tmp/large_out.txt
+          echo "Parallel transcoding verified"
