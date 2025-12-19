@@ -11,12 +11,13 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use crossbeam::channel::{bounded, Receiver, Sender};
 
 use super::boundary::{tokens_to_bytes, BoundaryResolver};
+use super::splitter::{BlockSplitter, DefaultSplitter, FastqSplitter};
 use crate::bgzf::BGZF_EOF;
 use crate::deflate::{DeflateParser, LZ77Token};
 use crate::error::{Error, Result};
 use crate::gzip::GzipHeader;
 use crate::huffman::HuffmanEncoder;
-use crate::{TranscodeConfig, TranscodeStats, Transcoder};
+use crate::{FormatProfile, TranscodeConfig, TranscodeStats, Transcoder};
 
 /// A job for encoding a single BGZF block
 struct EncodingJob {
@@ -128,6 +129,22 @@ impl ParallelTranscoder {
         let mut parser = DeflateParser::new(&mut reader);
         let mut resolver = BoundaryResolver::new();
 
+        // Create splitter based on config
+        let use_smart = self.config.use_smart_boundaries();
+        let mut splitter: Box<dyn BlockSplitter> =
+            if use_smart && self.config.format == FormatProfile::Fastq {
+                Box::new(FastqSplitter::new())
+            } else {
+                Box::new(DefaultSplitter)
+            };
+
+        // Maximum block size with overshoot allowance for smart boundaries
+        let max_block_size = if use_smart {
+            (self.config.block_size as f64 * 1.1) as usize
+        } else {
+            self.config.block_size
+        };
+
         // Accumulator for current BGZF block
         let mut pending_tokens: Vec<LZ77Token> = Vec::with_capacity(8192);
         let mut pending_uncompressed_size: usize = 0;
@@ -154,10 +171,24 @@ impl ParallelTranscoder {
 
                     let token_size = token.uncompressed_size();
 
-                    // Check if adding this token would exceed BGZF block size
-                    if pending_uncompressed_size + token_size > self.config.block_size
-                        && !pending_tokens.is_empty()
-                    {
+                    // Update splitter with this token
+                    splitter.process_token(&token);
+
+                    // Determine if we should emit a block
+                    let should_emit = if use_smart {
+                        let near_target =
+                            pending_uncompressed_size + token_size >= self.config.block_size;
+                        let at_good_split = splitter.is_good_split_point();
+                        let exceeds_max = pending_uncompressed_size + token_size > max_block_size;
+
+                        !pending_tokens.is_empty()
+                            && ((near_target && at_good_split) || exceeds_max)
+                    } else {
+                        pending_uncompressed_size + token_size > self.config.block_size
+                            && !pending_tokens.is_empty()
+                    };
+
+                    if should_emit {
                         // Resolve boundaries only - workers will compute CRC in parallel
                         let (resolved, uncompressed_size) = resolver
                             .resolve_block_for_parallel(block_start_position, &pending_tokens);
@@ -207,6 +238,7 @@ impl ParallelTranscoder {
                         block_start_position = resolver.position();
                         pending_tokens.clear();
                         pending_uncompressed_size = 0;
+                        splitter.reset();
                     }
 
                     // No clone needed - we own the token

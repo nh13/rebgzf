@@ -1,12 +1,11 @@
 use super::boundary::BoundaryResolver;
+use super::splitter::{BlockSplitter, DefaultSplitter, FastqSplitter};
 use crate::bgzf::BgzfBlockWriter;
 use crate::deflate::{DeflateParser, LZ77Token};
 use crate::error::Result;
 use crate::gzip::GzipHeader;
 use crate::huffman::HuffmanEncoder;
-use crate::TranscodeConfig;
-use crate::TranscodeStats;
-use crate::Transcoder;
+use crate::{FormatProfile, TranscodeConfig, TranscodeStats, Transcoder};
 use std::io::{BufReader, BufWriter, Read, Write};
 
 /// Single-threaded transcoder implementation
@@ -34,6 +33,23 @@ impl Transcoder for SingleThreadedTranscoder {
         let mut encoder = HuffmanEncoder::new(self.config.use_fixed_huffman());
         let mut bgzf_writer = BgzfBlockWriter::new(&mut writer);
 
+        // Create splitter based on config
+        let use_smart = self.config.use_smart_boundaries();
+        let mut splitter: Box<dyn BlockSplitter> =
+            if use_smart && self.config.format == FormatProfile::Fastq {
+                Box::new(FastqSplitter::new())
+            } else {
+                Box::new(DefaultSplitter)
+            };
+
+        // Maximum block size with overshoot allowance for smart boundaries
+        // Allow up to 10% overshoot to find a good split point
+        let max_block_size = if use_smart {
+            (self.config.block_size as f64 * 1.1) as usize
+        } else {
+            self.config.block_size
+        };
+
         // Accumulator for current BGZF block
         let mut pending_tokens: Vec<LZ77Token> = Vec::with_capacity(8192);
         let mut pending_uncompressed_size: usize = 0;
@@ -55,10 +71,27 @@ impl Transcoder for SingleThreadedTranscoder {
 
                     let token_size = token.uncompressed_size();
 
-                    // Check if adding this token would exceed BGZF block size
-                    if pending_uncompressed_size + token_size > self.config.block_size
-                        && !pending_tokens.is_empty()
-                    {
+                    // Update splitter with this token
+                    splitter.process_token(&token);
+
+                    // Determine if we should emit a block
+                    let should_emit = if use_smart {
+                        // Smart mode: emit when at good split point near target size,
+                        // or when we exceed max size
+                        let near_target =
+                            pending_uncompressed_size + token_size >= self.config.block_size;
+                        let at_good_split = splitter.is_good_split_point();
+                        let exceeds_max = pending_uncompressed_size + token_size > max_block_size;
+
+                        !pending_tokens.is_empty()
+                            && ((near_target && at_good_split) || exceeds_max)
+                    } else {
+                        // Simple mode: emit when exceeding target size
+                        pending_uncompressed_size + token_size > self.config.block_size
+                            && !pending_tokens.is_empty()
+                    };
+
+                    if should_emit {
                         // Emit current BGZF block
                         self.emit_block(
                             &mut resolver,
@@ -72,6 +105,7 @@ impl Transcoder for SingleThreadedTranscoder {
                         block_start_position = resolver.position();
                         pending_tokens.clear();
                         pending_uncompressed_size = 0;
+                        splitter.reset();
                     }
 
                     // Add token to pending (no clone needed - we own the token)
