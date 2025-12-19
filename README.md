@@ -26,11 +26,27 @@ This avoids the expensive compression step entirely - we're just re-serializing 
 
 ### Performance
 
-Half-decompression is typically **2-4x faster** than full decompress + recompress, because:
+Half-decompression can be faster than full decompress + recompress because:
 - No dictionary lookups for compression
 - No hash table maintenance
 - Minimal memory footprint (just the sliding window)
 - Parallel encoding of independent blocks
+
+**Trade-offs:**
+- Fixed Huffman encoding (default) is faster but produces larger output (~30% larger)
+- DEFLATE parsing is sequential, limiting parallel speedup
+- Best suited for format conversion rather than optimal compression
+
+**Benchmark Results** (50MB uncompressed, 38MB gzip input):
+
+| Threads | Time    | Throughput | Speedup |
+|---------|---------|------------|---------|
+| 1       | 1.71s   | 23.3 MB/s  | 1.0x    |
+| 2       | 1.38s   | 28.7 MB/s  | 1.24x   |
+| 4       | 1.39s   | 28.6 MB/s  | 1.23x   |
+| 8       | 1.38s   | 28.7 MB/s  | 1.24x   |
+
+*Note: Parallel scaling is limited because DEFLATE parsing is inherently sequential. Multi-threading accelerates only the Huffman re-encoding stage.*
 
 ## Installation
 

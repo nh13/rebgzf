@@ -160,26 +160,37 @@ impl ParallelTranscoder {
                     let job = EncodingJob { block_id: next_block_id, tokens: resolved };
                     next_block_id += 1;
 
-                    // Try to send job - if channel is full, drain some results first
-                    loop {
-                        match job_tx.try_send(job.clone()) {
-                            Ok(()) => break,
-                            Err(crossbeam::channel::TrySendError::Full(_)) => {
-                                // Channel full, drain one result
-                                if let Ok(result) = result_rx.try_recv() {
-                                    let block = result?;
-                                    Self::buffer_and_write_block(
-                                        &mut writer,
-                                        block,
-                                        &mut pending_blocks,
-                                        &mut next_write_id,
-                                        &mut blocks_written,
-                                        &mut output_bytes,
-                                    )?;
+                    // Send job, draining results as needed to prevent deadlock
+                    let mut job_to_send = Some(job);
+                    while job_to_send.is_some() {
+                        crossbeam::channel::select! {
+                            send(job_tx, job_to_send.clone().unwrap()) -> res => {
+                                match res {
+                                    Ok(()) => { job_to_send = None; }
+                                    Err(_) => {
+                                        return Err(Error::Internal("Workers disconnected".to_string()));
+                                    }
                                 }
                             }
-                            Err(crossbeam::channel::TrySendError::Disconnected(_)) => {
-                                return Err(Error::Internal("Workers disconnected".to_string()));
+                            recv(result_rx) -> res => {
+                                match res {
+                                    Ok(result) => {
+                                        let block = result?;
+                                        Self::buffer_and_write_block(
+                                            &mut writer,
+                                            block,
+                                            &mut pending_blocks,
+                                            &mut next_write_id,
+                                            &mut blocks_written,
+                                            &mut output_bytes,
+                                        )?;
+                                    }
+                                    Err(_) => {
+                                        return Err(Error::Internal(
+                                            "Result channel disconnected".to_string(),
+                                        ));
+                                    }
+                                }
                             }
                         }
                     }
