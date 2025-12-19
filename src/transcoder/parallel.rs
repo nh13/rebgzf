@@ -209,19 +209,17 @@ impl ParallelTranscoder {
                         next_block_id += 1;
 
                         // Send job, draining results as needed to prevent deadlock
+                        // Use try_send to avoid cloning - it returns the job on failure
                         let mut job_to_send = Some(job);
-                        while job_to_send.is_some() {
-                            crossbeam::channel::select! {
-                                send(job_tx, job_to_send.clone().unwrap()) -> res => {
-                                    match res {
-                                        Ok(()) => { job_to_send = None; }
-                                        Err(_) => {
-                                            return Err(Error::Internal("Workers disconnected".to_string()));
-                                        }
-                                    }
+                        while let Some(job) = job_to_send.take() {
+                            match job_tx.try_send(job) {
+                                Ok(()) => {
+                                    // Sent successfully
                                 }
-                                recv(result_rx) -> res => {
-                                    match res {
+                                Err(crossbeam::channel::TrySendError::Full(returned_job)) => {
+                                    // Channel full - put job back and drain a result
+                                    job_to_send = Some(returned_job);
+                                    match result_rx.recv() {
                                         Ok(result) => {
                                             let block = result?;
                                             Self::buffer_and_write_block(
@@ -243,6 +241,11 @@ impl ParallelTranscoder {
                                             ));
                                         }
                                     }
+                                }
+                                Err(crossbeam::channel::TrySendError::Disconnected(_)) => {
+                                    return Err(Error::Internal(
+                                        "Workers disconnected".to_string(),
+                                    ));
                                 }
                             }
                         }
@@ -414,17 +417,6 @@ impl ParallelTranscoder {
         *current_uncompressed_offset += uncompressed_size as u64;
 
         Ok(())
-    }
-}
-
-// Need Clone for EncodingJob to handle retry in try_send
-impl Clone for EncodingJob {
-    fn clone(&self) -> Self {
-        Self {
-            block_id: self.block_id,
-            tokens: self.tokens.clone(),
-            uncompressed_size: self.uncompressed_size,
-        }
     }
 }
 

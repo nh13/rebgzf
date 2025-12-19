@@ -24,6 +24,9 @@ path = "src/bin/rebgzf.rs"
 # CRC32 for BGZF footer
 crc32fast = "1.3"
 
+# DEFLATE decompression for --verify mode
+flate2 = "1.0"
+
 # Parallel processing
 crossbeam = "0.8"
 num_cpus = "1.16"

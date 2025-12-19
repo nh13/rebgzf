@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use rebgzf::{
-    is_bgzf, validate_bgzf_streaming, validate_bgzf_strict, BgzfValidation, CompressionLevel,
-    FormatProfile, ParallelTranscoder, SingleThreadedTranscoder, TranscodeConfig, Transcoder,
+    is_bgzf, validate_bgzf_streaming, validate_bgzf_strict, verify_bgzf, BgzfValidation,
+    BgzfVerification, CompressionLevel, FormatProfile, ParallelTranscoder,
+    SingleThreadedTranscoder, TranscodeConfig, Transcoder,
 };
 
 /// Format argument for CLI (maps to FormatProfile)
@@ -43,7 +44,7 @@ struct Args {
     input: PathBuf,
 
     /// Output BGZF file (use - for stdout)
-    #[arg(short, long, required_unless_present = "check")]
+    #[arg(short, long, required_unless_present_any = ["check", "verify", "stats"])]
     output: Option<PathBuf>,
 
     /// Number of threads (0 = auto, 1 = single-threaded)
@@ -66,6 +67,14 @@ struct Args {
     #[arg(short, long)]
     verbose: bool,
 
+    /// Quiet mode - suppress all output except errors
+    #[arg(short, long)]
+    quiet: bool,
+
+    /// Output results as JSON (for scripting)
+    #[arg(long)]
+    json: bool,
+
     /// Check if input is BGZF and exit (0=BGZF, 1=not BGZF, 2=error)
     #[arg(long)]
     check: bool,
@@ -73,6 +82,14 @@ struct Args {
     /// Validate all BGZF blocks (slower, more thorough)
     #[arg(long)]
     strict: bool,
+
+    /// Verify BGZF by decompressing and checking CRC32 (0=valid, 1=invalid, 2=error)
+    #[arg(long)]
+    verify: bool,
+
+    /// Show file statistics without transcoding
+    #[arg(long)]
+    stats: bool,
 
     /// Force transcoding even if input is already BGZF
     #[arg(long)]
@@ -91,6 +108,11 @@ struct Args {
 const EXIT_IS_BGZF: u8 = 0;
 const EXIT_NOT_BGZF: u8 = 1;
 const EXIT_ERROR: u8 = 2;
+
+/// Exit codes for --verify mode
+const EXIT_VERIFY_VALID: u8 = 0;
+const EXIT_VERIFY_INVALID: u8 = 1;
+// EXIT_ERROR (2) also used for verify errors
 
 /// Progress tracking state shared between reader wrapper and progress thread
 struct ProgressState {
@@ -208,6 +230,16 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
     // Handle --check mode
     if args.check {
         return run_check_mode(&args);
+    }
+
+    // Handle --verify mode
+    if args.verify {
+        return run_verify_mode(&args);
+    }
+
+    // Handle --stats mode
+    if args.stats {
+        return run_stats_mode(&args);
     }
 
     // Normal transcoding mode - output is required
@@ -386,7 +418,7 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
         }
     }
 
-    if args.verbose || args.progress {
+    if !args.quiet && (args.verbose || args.progress) {
         eprintln!("Transcoding complete:");
         eprintln!("  Input bytes:      {}", stats.input_bytes);
         eprintln!("  Output bytes:     {}", stats.output_bytes);
@@ -432,13 +464,25 @@ fn run_check_mode(args: &Args) -> Result<u8, Box<dyn std::error::Error>> {
     };
 
     // Output results
-    eprintln!("BGZF: {}", if validation.is_valid_bgzf { "yes" } else { "no" });
+    if args.json {
+        println!(
+            "{{\"is_bgzf\":{},\"block_count\":{},\"uncompressed_size\":{}}}",
+            validation.is_valid_bgzf,
+            validation.block_count.map(|b| b.to_string()).unwrap_or_else(|| "null".to_string()),
+            validation
+                .total_uncompressed_size
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "null".to_string())
+        );
+    } else if !args.quiet {
+        eprintln!("BGZF: {}", if validation.is_valid_bgzf { "yes" } else { "no" });
 
-    if let Some(blocks) = validation.block_count {
-        eprintln!("Blocks: {}", blocks);
-    }
-    if let Some(size) = validation.total_uncompressed_size {
-        eprintln!("Uncompressed size: {} bytes", size);
+        if let Some(blocks) = validation.block_count {
+            eprintln!("Blocks: {}", blocks);
+        }
+        if let Some(size) = validation.total_uncompressed_size {
+            eprintln!("Uncompressed size: {} bytes", size);
+        }
     }
 
     if validation.is_valid_bgzf {
@@ -446,4 +490,200 @@ fn run_check_mode(args: &Args) -> Result<u8, Box<dyn std::error::Error>> {
     } else {
         Ok(EXIT_NOT_BGZF)
     }
+}
+
+fn run_verify_mode(args: &Args) -> Result<u8, Box<dyn std::error::Error>> {
+    let is_stdin = args.input.to_str() == Some("-");
+
+    // Get file size for progress (if not stdin)
+    let total_size =
+        if !is_stdin { std::fs::metadata(&args.input).ok().map(|m| m.len()) } else { None };
+
+    // Set up progress tracking if enabled
+    let progress_state = if args.progress {
+        Some(Arc::new(ProgressState {
+            bytes_read: AtomicU64::new(0),
+            total_size,
+            done: AtomicBool::new(false),
+        }))
+    } else {
+        None
+    };
+
+    // Spawn progress thread if enabled
+    let progress_handle =
+        progress_state.as_ref().map(|state| spawn_progress_thread(Arc::clone(state)));
+
+    let start = Instant::now();
+
+    let verification: BgzfVerification = if is_stdin {
+        let stdin = io::stdin().lock();
+        if let Some(ref state) = progress_state {
+            verify_bgzf(&mut ProgressReader::new(stdin, Arc::clone(state)))?
+        } else {
+            verify_bgzf(&mut io::stdin().lock())?
+        }
+    } else {
+        let file = BufReader::new(File::open(&args.input)?);
+        if let Some(ref state) = progress_state {
+            verify_bgzf(&mut ProgressReader::new(file, Arc::clone(state)))?
+        } else {
+            verify_bgzf(&mut BufReader::new(File::open(&args.input)?))?
+        }
+    };
+
+    let elapsed = start.elapsed();
+
+    // Signal progress thread to stop
+    if let Some(ref state) = progress_state {
+        state.done.store(true, Ordering::Relaxed);
+    }
+    if let Some(handle) = progress_handle {
+        let _ = handle.join();
+    }
+
+    // Determine overall validity
+    let is_valid = verification.is_valid_bgzf && verification.crc_valid && verification.isize_valid;
+
+    // Output results
+    if args.json {
+        println!(
+            "{{\"valid\":{},\"is_valid_bgzf\":{},\"crc_valid\":{},\"isize_valid\":{},\"block_count\":{},\"compressed_size\":{},\"uncompressed_size\":{},\"first_error_block\":{},\"first_error\":{}}}",
+            is_valid,
+            verification.is_valid_bgzf,
+            verification.crc_valid,
+            verification.isize_valid,
+            verification.block_count,
+            verification.compressed_size,
+            verification.uncompressed_size,
+            verification.first_error_block.map(|b| b.to_string()).unwrap_or_else(|| "null".to_string()),
+            verification.first_error.as_ref().map(|e| format!("\"{}\"", e.replace('\"', "\\\""))).unwrap_or_else(|| "null".to_string())
+        );
+    } else if !args.quiet {
+        eprintln!("Valid: {}", if is_valid { "yes" } else { "no" });
+        eprintln!("BGZF structure: {}", if verification.is_valid_bgzf { "ok" } else { "invalid" });
+        eprintln!("CRC32 checksums: {}", if verification.crc_valid { "ok" } else { "MISMATCH" });
+        eprintln!("ISIZE values: {}", if verification.isize_valid { "ok" } else { "MISMATCH" });
+        eprintln!("Blocks: {}", verification.block_count);
+        eprintln!("Compressed size: {} bytes", verification.compressed_size);
+        eprintln!("Uncompressed size: {} bytes", verification.uncompressed_size);
+
+        if let Some(err) = &verification.first_error {
+            if let Some(block) = verification.first_error_block {
+                eprintln!("First error at block {}: {}", block, err);
+            } else {
+                eprintln!("Error: {}", err);
+            }
+        }
+
+        if args.verbose || args.progress {
+            let throughput = if elapsed.as_secs_f64() > 0.0 {
+                verification.compressed_size as f64 / elapsed.as_secs_f64() / 1_000_000.0
+            } else {
+                0.0
+            };
+            eprintln!("Time: {:.2?}", elapsed);
+            eprintln!("Throughput: {:.1} MB/s", throughput);
+        }
+    }
+
+    if is_valid {
+        Ok(EXIT_VERIFY_VALID)
+    } else {
+        Ok(EXIT_VERIFY_INVALID)
+    }
+}
+
+fn run_stats_mode(args: &Args) -> Result<u8, Box<dyn std::error::Error>> {
+    let is_stdin = args.input.to_str() == Some("-");
+
+    // Get file size
+    let file_size =
+        if !is_stdin { std::fs::metadata(&args.input).ok().map(|m| m.len()) } else { None };
+
+    // First, check if it's BGZF
+    let is_bgzf_file = if is_stdin {
+        // For stdin, we need to read the data and check
+        // Use streaming validation which will tell us format
+        let mut stdin = io::stdin().lock();
+        let validation = validate_bgzf_streaming(&mut stdin)?;
+        validation.is_valid_bgzf
+    } else {
+        let mut file = BufReader::new(File::open(&args.input)?);
+        is_bgzf(&mut file)?
+    };
+
+    // For BGZF files, get detailed statistics
+    let validation = if is_bgzf_file && !is_stdin {
+        let mut file = BufReader::new(File::open(&args.input)?);
+        Some(validate_bgzf_strict(&mut file)?)
+    } else {
+        None
+    };
+
+    if args.json {
+        // JSON output
+        let block_count = validation.as_ref().and_then(|v| v.block_count);
+        let uncompressed_size = validation.as_ref().and_then(|v| v.total_uncompressed_size);
+        let ratio = match (file_size, uncompressed_size) {
+            (Some(f), Some(u)) if u > 0 => Some(u as f64 / f as f64),
+            _ => None,
+        };
+
+        println!(
+            "{{\"file\":\"{}\",\"file_size\":{},\"format\":\"{}\",\"block_count\":{},\"uncompressed_size\":{},\"compression_ratio\":{}}}",
+            args.input.display().to_string().replace('\"', "\\\""),
+            file_size.map(|s| s.to_string()).unwrap_or_else(|| "null".to_string()),
+            if is_bgzf_file { "bgzf" } else { "gzip" },
+            block_count.map(|b| b.to_string()).unwrap_or_else(|| "null".to_string()),
+            uncompressed_size.map(|s| s.to_string()).unwrap_or_else(|| "null".to_string()),
+            ratio.map(|r| format!("{:.2}", r)).unwrap_or_else(|| "null".to_string())
+        );
+    } else if !args.quiet {
+        eprintln!("File: {}", args.input.display());
+        if let Some(size) = file_size {
+            eprintln!("File size: {} bytes ({})", size, format_bytes(size));
+        }
+        eprintln!("Format: {}", if is_bgzf_file { "BGZF" } else { "gzip" });
+
+        if let Some(validation) = validation {
+            if let Some(blocks) = validation.block_count {
+                eprintln!("BGZF blocks: {}", blocks);
+                if blocks > 1 {
+                    // EOF block is typically 28 bytes
+                    let data_blocks = blocks - 1;
+                    eprintln!("Data blocks: {}", data_blocks);
+                }
+            }
+
+            if let Some(uncompressed) = validation.total_uncompressed_size {
+                eprintln!(
+                    "Uncompressed size: {} bytes ({})",
+                    uncompressed,
+                    format_bytes(uncompressed)
+                );
+
+                if let Some(size) = file_size {
+                    let ratio = uncompressed as f64 / size as f64;
+                    let compression_pct = (1.0 - (size as f64 / uncompressed as f64)) * 100.0;
+                    eprintln!("Compression ratio: {:.2}x", ratio);
+                    eprintln!("Space savings: {:.1}%", compression_pct);
+
+                    if let Some(blocks) = validation.block_count {
+                        if blocks > 1 {
+                            let avg_compressed = (size - 28) as f64 / (blocks - 1) as f64;
+                            let avg_uncompressed = uncompressed as f64 / (blocks - 1) as f64;
+                            eprintln!("Avg compressed block: {:.0} bytes", avg_compressed);
+                            eprintln!("Avg uncompressed block: {:.0} bytes", avg_uncompressed);
+                        }
+                    }
+                }
+            }
+        } else if !is_bgzf_file && !is_stdin {
+            // For plain gzip, try to decompress and get size
+            eprintln!("Note: For detailed gzip statistics, use --verify mode");
+        }
+    }
+
+    Ok(0)
 }

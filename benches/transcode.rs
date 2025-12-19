@@ -254,7 +254,7 @@ fn bench_fastq_realistic(c: &mut Criterion) {
 }
 
 fn bench_bgzf_detection(c: &mut Criterion) {
-    use rebgzf::{is_bgzf, validate_bgzf_strict};
+    use rebgzf::{is_bgzf, validate_bgzf_strict, verify_bgzf};
 
     let mut group = c.benchmark_group("bgzf_detection");
 
@@ -279,6 +279,13 @@ fn bench_bgzf_detection(c: &mut Criterion) {
         b.iter(|| {
             let mut cursor = Cursor::new(&bgzf_data);
             validate_bgzf_strict(&mut cursor).unwrap()
+        });
+    });
+
+    group.bench_function("verify_bgzf_full", |b| {
+        b.iter(|| {
+            let mut cursor = Cursor::new(&bgzf_data);
+            verify_bgzf(&mut cursor).unwrap()
         });
     });
 

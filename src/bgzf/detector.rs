@@ -4,6 +4,7 @@
 //! (all blocks) for BGZF files.
 
 use crate::error::{Error, Result};
+use flate2::read::DeflateDecoder;
 use std::io::{Read, Seek, SeekFrom};
 
 /// Result of BGZF validation
@@ -15,6 +16,27 @@ pub struct BgzfValidation {
     pub block_count: Option<u64>,
     /// Total uncompressed size across all blocks (only populated in strict mode)
     pub total_uncompressed_size: Option<u64>,
+}
+
+/// Result of BGZF verification (deep validation with decompression)
+#[derive(Clone, Debug, Default)]
+pub struct BgzfVerification {
+    /// Whether the file is valid BGZF (structure check)
+    pub is_valid_bgzf: bool,
+    /// Whether all CRC32 checksums are correct
+    pub crc_valid: bool,
+    /// Whether all ISIZE values match decompressed sizes
+    pub isize_valid: bool,
+    /// Number of BGZF blocks processed
+    pub block_count: u64,
+    /// Total compressed size (input bytes)
+    pub compressed_size: u64,
+    /// Total uncompressed size across all blocks
+    pub uncompressed_size: u64,
+    /// Block number where first error was found (if any)
+    pub first_error_block: Option<u64>,
+    /// Description of first error (if any)
+    pub first_error: Option<String>,
 }
 
 /// BGZF header constants
@@ -190,6 +212,144 @@ fn validate_bgzf_impl<R: Read>(reader: &mut R) -> Result<BgzfValidation> {
         block_count: Some(block_count),
         total_uncompressed_size: Some(total_uncompressed_size),
     })
+}
+
+/// Deep verification - decompresses all blocks and verifies CRC32 checksums.
+///
+/// This performs thorough verification by:
+/// 1. Reading every BGZF block header
+/// 2. Decompressing the DEFLATE data
+/// 3. Computing CRC32 of decompressed data
+/// 4. Comparing against stored CRC32 in footer
+/// 5. Verifying ISIZE matches decompressed size
+///
+/// This is slower than `validate_bgzf_strict` but catches data corruption.
+pub fn verify_bgzf<R: Read>(reader: &mut R) -> Result<BgzfVerification> {
+    let mut result = BgzfVerification {
+        is_valid_bgzf: true,
+        crc_valid: true,
+        isize_valid: true,
+        ..Default::default()
+    };
+
+    loop {
+        let mut header = [0u8; MIN_HEADER_SIZE];
+
+        match reader.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // End of file
+                if result.block_count == 0 {
+                    result.is_valid_bgzf = false;
+                    result.first_error = Some("Empty or truncated file".to_string());
+                }
+                break;
+            }
+            Err(e) => return Err(Error::Io(e)),
+        }
+
+        // Validate header
+        if !validate_bgzf_header(&header) {
+            result.is_valid_bgzf = false;
+            if result.first_error.is_none() {
+                result.first_error_block = Some(result.block_count);
+                result.first_error = Some("Invalid BGZF header".to_string());
+            }
+            break;
+        }
+
+        // Get BSIZE (total block size - 1) from bytes 16-17
+        let bsize = u16::from_le_bytes([header[16], header[17]]) as usize;
+        let block_size = bsize + 1;
+        result.compressed_size += block_size as u64;
+
+        // Calculate compressed data size (block_size - header - footer)
+        let compressed_data_size = block_size.saturating_sub(MIN_HEADER_SIZE + 8);
+
+        if compressed_data_size == 0 && block_size < MIN_HEADER_SIZE + 8 {
+            result.is_valid_bgzf = false;
+            if result.first_error.is_none() {
+                result.first_error_block = Some(result.block_count);
+                result.first_error = Some("Block too small".to_string());
+            }
+            break;
+        }
+
+        // Read compressed data
+        let mut compressed_data = vec![0u8; compressed_data_size];
+        if let Err(e) = reader.read_exact(&mut compressed_data) {
+            result.is_valid_bgzf = false;
+            if result.first_error.is_none() {
+                result.first_error_block = Some(result.block_count);
+                result.first_error = Some(format!("Failed to read block data: {}", e));
+            }
+            break;
+        }
+
+        // Read footer (CRC32 + ISIZE)
+        let mut footer = [0u8; 8];
+        if let Err(e) = reader.read_exact(&mut footer) {
+            result.is_valid_bgzf = false;
+            if result.first_error.is_none() {
+                result.first_error_block = Some(result.block_count);
+                result.first_error = Some(format!("Failed to read footer: {}", e));
+            }
+            break;
+        }
+
+        let stored_crc = u32::from_le_bytes([footer[0], footer[1], footer[2], footer[3]]);
+        let stored_isize = u32::from_le_bytes([footer[4], footer[5], footer[6], footer[7]]);
+
+        // Decompress data
+        let mut decompressed = Vec::new();
+        let mut decoder = DeflateDecoder::new(&compressed_data[..]);
+        if let Err(e) = decoder.read_to_end(&mut decompressed) {
+            result.is_valid_bgzf = false;
+            if result.first_error.is_none() {
+                result.first_error_block = Some(result.block_count);
+                result.first_error = Some(format!("Decompression failed: {}", e));
+            }
+            // Continue checking other blocks for stats
+            result.block_count += 1;
+            continue;
+        }
+
+        // Verify ISIZE
+        if decompressed.len() as u32 != stored_isize {
+            result.isize_valid = false;
+            if result.first_error.is_none() {
+                result.first_error_block = Some(result.block_count);
+                result.first_error = Some(format!(
+                    "ISIZE mismatch: stored {} but decompressed {} bytes",
+                    stored_isize,
+                    decompressed.len()
+                ));
+            }
+        }
+
+        // Compute and verify CRC32
+        let computed_crc = crc32fast::hash(&decompressed);
+        if computed_crc != stored_crc {
+            result.crc_valid = false;
+            if result.first_error.is_none() {
+                result.first_error_block = Some(result.block_count);
+                result.first_error = Some(format!(
+                    "CRC32 mismatch: stored {:08x} but computed {:08x}",
+                    stored_crc, computed_crc
+                ));
+            }
+        }
+
+        result.uncompressed_size += decompressed.len() as u64;
+        result.block_count += 1;
+
+        // Check for EOF block
+        if stored_isize == 0 && block_size == 28 {
+            break;
+        }
+    }
+
+    Ok(result)
 }
 
 #[cfg(test)]

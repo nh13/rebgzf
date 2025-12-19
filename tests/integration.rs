@@ -10,7 +10,7 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 
 use rebgzf::{
-    is_bgzf, validate_bgzf_streaming, validate_bgzf_strict, ParallelTranscoder,
+    is_bgzf, validate_bgzf_streaming, validate_bgzf_strict, verify_bgzf, ParallelTranscoder,
     SingleThreadedTranscoder, TranscodeConfig, Transcoder,
 };
 
@@ -468,6 +468,168 @@ fn test_validate_bgzf_strict_invalid() {
     let validation = validate_bgzf_strict(&mut cursor).unwrap();
 
     assert!(!validation.is_valid_bgzf);
+}
+
+// ============================================================================
+// Round-Trip Property Tests
+// ============================================================================
+
+/// Property test: any data compressed to gzip then transcoded to BGZF
+/// should decompress to the original data.
+#[test]
+fn test_roundtrip_property_random_data() {
+    // Test with various sizes
+    // Use smaller block size for random/incompressible data to avoid exceeding BGZF max
+    for size in [0, 1, 10, 100, 1000, 10000, 100000] {
+        let data = generate_random_data(size, size as u64);
+        let gzip_data = compress_to_gzip(&data);
+
+        // Transcode to BGZF with smaller block size for incompressible data
+        let config = TranscodeConfig { block_size: 32768, ..Default::default() };
+        let mut transcoder = SingleThreadedTranscoder::new(config);
+        let mut bgzf_data = Vec::new();
+        transcoder.transcode(Cursor::new(&gzip_data), &mut bgzf_data).unwrap();
+
+        // Decompress and verify
+        let decompressed = decompress_gzip(&bgzf_data);
+        assert_eq!(decompressed, data, "Round-trip failed for size {}", size);
+    }
+}
+
+#[test]
+fn test_roundtrip_property_repetitive_data() {
+    for size in [100, 1000, 10000, 50000] {
+        let data = generate_repetitive_data(size);
+        let gzip_data = compress_to_gzip(&data);
+
+        let config = TranscodeConfig::default();
+        let mut transcoder = SingleThreadedTranscoder::new(config);
+        let mut bgzf_data = Vec::new();
+        transcoder.transcode(Cursor::new(&gzip_data), &mut bgzf_data).unwrap();
+
+        let decompressed = decompress_gzip(&bgzf_data);
+        assert_eq!(decompressed, data, "Round-trip failed for repetitive data size {}", size);
+    }
+}
+
+#[test]
+fn test_roundtrip_property_fastq_data() {
+    for num_reads in [10, 100, 1000] {
+        let data = generate_fastq_data(num_reads, 150);
+        let gzip_data = compress_to_gzip(&data);
+
+        let config = TranscodeConfig::default();
+        let mut transcoder = SingleThreadedTranscoder::new(config);
+        let mut bgzf_data = Vec::new();
+        transcoder.transcode(Cursor::new(&gzip_data), &mut bgzf_data).unwrap();
+
+        let decompressed = decompress_gzip(&bgzf_data);
+        assert_eq!(decompressed, data, "Round-trip failed for FASTQ {} reads", num_reads);
+    }
+}
+
+#[test]
+fn test_roundtrip_property_all_bytes() {
+    // Test that all byte values survive the round-trip
+    let mut data = Vec::with_capacity(256 * 10);
+    for _ in 0..10 {
+        for b in 0..=255u8 {
+            data.push(b);
+        }
+    }
+
+    let gzip_data = compress_to_gzip(&data);
+
+    let config = TranscodeConfig::default();
+    let mut transcoder = SingleThreadedTranscoder::new(config);
+    let mut bgzf_data = Vec::new();
+    transcoder.transcode(Cursor::new(&gzip_data), &mut bgzf_data).unwrap();
+
+    let decompressed = decompress_gzip(&bgzf_data);
+    assert_eq!(decompressed, data, "All-bytes round-trip failed");
+}
+
+#[test]
+fn test_roundtrip_property_parallel() {
+    // Test parallel transcoding preserves data
+    let data = generate_mixed_data(200_000);
+    let gzip_data = compress_to_gzip(&data);
+
+    for threads in [2, 4, 8] {
+        let config = TranscodeConfig { num_threads: threads, ..Default::default() };
+        let mut transcoder = ParallelTranscoder::new(config);
+        let mut bgzf_data = Vec::new();
+        transcoder.transcode(Cursor::new(&gzip_data), &mut bgzf_data).unwrap();
+
+        let decompressed = decompress_gzip(&bgzf_data);
+        assert_eq!(decompressed, data, "Parallel round-trip failed with {} threads", threads);
+    }
+}
+
+#[test]
+fn test_roundtrip_property_compression_levels() {
+    // Test all compression levels preserve data
+    use rebgzf::CompressionLevel;
+
+    let data = generate_mixed_data(50_000);
+    let gzip_data = compress_to_gzip(&data);
+
+    for level in 1..=9 {
+        let config = TranscodeConfig {
+            compression_level: CompressionLevel::from_level(level),
+            ..Default::default()
+        };
+        let mut transcoder = SingleThreadedTranscoder::new(config);
+        let mut bgzf_data = Vec::new();
+        transcoder.transcode(Cursor::new(&gzip_data), &mut bgzf_data).unwrap();
+
+        let decompressed = decompress_gzip(&bgzf_data);
+        assert_eq!(decompressed, data, "Round-trip failed at compression level {}", level);
+    }
+}
+
+// ============================================================================
+// BGZF Verification Tests (Deep validation with CRC check)
+// ============================================================================
+
+#[test]
+fn test_verify_bgzf_valid() {
+    // Use compressible data
+    let data = generate_mixed_data(100_000);
+    let gzip_data = compress_to_gzip(&data);
+
+    // Transcode to BGZF
+    let config = TranscodeConfig::default();
+    let mut transcoder = SingleThreadedTranscoder::new(config);
+    let mut bgzf_data = Vec::new();
+    transcoder.transcode(Cursor::new(&gzip_data), &mut bgzf_data).unwrap();
+
+    // Deep verification
+    let mut cursor = Cursor::new(&bgzf_data);
+    let verification = verify_bgzf(&mut cursor).unwrap();
+
+    assert!(verification.is_valid_bgzf, "Should be valid BGZF");
+    assert!(verification.crc_valid, "CRC32 checksums should match");
+    assert!(verification.isize_valid, "ISIZE values should match");
+    assert!(verification.block_count >= 2, "Should have data + EOF blocks");
+    assert_eq!(
+        verification.uncompressed_size as usize,
+        data.len(),
+        "Uncompressed size should match original data"
+    );
+    assert!(verification.first_error.is_none(), "Should have no errors");
+}
+
+#[test]
+fn test_verify_bgzf_invalid_not_bgzf() {
+    // Plain gzip is not valid BGZF
+    let gzip_data = compress_to_gzip(b"Hello");
+
+    let mut cursor = Cursor::new(&gzip_data);
+    let verification = verify_bgzf(&mut cursor).unwrap();
+
+    assert!(!verification.is_valid_bgzf, "Plain gzip should not be valid BGZF");
+    assert!(verification.first_error.is_some(), "Should have error message");
 }
 
 // ============================================================================

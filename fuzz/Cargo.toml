@@ -1,0 +1,42 @@
+[package]
+name = "rebgzf-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.rebgzf]
+path = ".."
+
+[dependencies.flate2]
+version = "1.0"
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_transcode"
+path = "fuzz_targets/fuzz_transcode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_verify"
+path = "fuzz_targets/fuzz_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_deflate_parser"
+path = "fuzz_targets/fuzz_deflate_parser.rs"
+test = false
+doc = false
+bench = false

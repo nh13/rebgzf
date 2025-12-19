@@ -1,25 +1,37 @@
 /// Bit-level writer for DEFLATE output
 ///
 /// Writes bits LSB-first to match DEFLATE format.
+/// Uses a 64-bit buffer for bulk writes, flushing when full.
 pub struct BitWriter {
     /// Accumulated output bytes
     output: Vec<u8>,
-    /// Current byte being built
-    current_byte: u8,
-    /// Bits written to current byte (0-7)
-    bits_in_byte: u8,
+    /// 64-bit buffer for accumulating bits before flushing
+    buffer: u64,
+    /// Number of bits currently in buffer (0-64)
+    bits_in_buffer: u8,
 }
 
 impl BitWriter {
     pub fn new() -> Self {
-        Self { output: Vec::with_capacity(65536), current_byte: 0, bits_in_byte: 0 }
+        Self { output: Vec::with_capacity(65536), buffer: 0, bits_in_buffer: 0 }
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
-        Self { output: Vec::with_capacity(capacity), current_byte: 0, bits_in_byte: 0 }
+        Self { output: Vec::with_capacity(capacity), buffer: 0, bits_in_buffer: 0 }
+    }
+
+    /// Flush complete bytes from buffer to output
+    #[inline]
+    fn flush_bytes(&mut self) {
+        while self.bits_in_buffer >= 8 {
+            self.output.push(self.buffer as u8);
+            self.buffer >>= 8;
+            self.bits_in_buffer -= 8;
+        }
     }
 
     /// Write `n` bits (1-32) from value in LSB-first order
+    #[inline]
     pub fn write_bits(&mut self, value: u32, n: u8) {
         debug_assert!(n <= 32);
 
@@ -27,25 +39,13 @@ impl BitWriter {
             return;
         }
 
-        let mut val = value;
-        let mut remaining = n;
+        // Add bits to buffer
+        self.buffer |= (value as u64) << self.bits_in_buffer;
+        self.bits_in_buffer += n;
 
-        while remaining > 0 {
-            let space = 8 - self.bits_in_byte;
-            let to_write = remaining.min(space);
-
-            let mask = (1u32 << to_write) - 1;
-            self.current_byte |= ((val & mask) as u8) << self.bits_in_byte;
-
-            val >>= to_write;
-            self.bits_in_byte += to_write;
-            remaining -= to_write;
-
-            if self.bits_in_byte == 8 {
-                self.output.push(self.current_byte);
-                self.current_byte = 0;
-                self.bits_in_byte = 0;
-            }
+        // Flush if buffer is getting full (leave room for next write)
+        if self.bits_in_buffer >= 32 {
+            self.flush_bytes();
         }
     }
 
@@ -64,16 +64,18 @@ impl BitWriter {
 
     /// Pad to byte boundary with zero bits
     pub fn align_to_byte(&mut self) {
-        if self.bits_in_byte > 0 {
-            self.output.push(self.current_byte);
-            self.current_byte = 0;
-            self.bits_in_byte = 0;
+        if self.bits_in_buffer % 8 != 0 {
+            // Round up to next byte boundary
+            self.bits_in_buffer = ((self.bits_in_buffer + 7) / 8) * 8;
         }
+        self.flush_bytes();
     }
 
     /// Write a raw byte (must be byte-aligned)
     pub fn write_byte(&mut self, byte: u8) {
-        if self.bits_in_byte == 0 {
+        if self.bits_in_buffer % 8 == 0 {
+            // Byte-aligned: flush buffer first, then push directly
+            self.flush_bytes();
             self.output.push(byte);
         } else {
             // Not aligned, write through bits
@@ -110,12 +112,12 @@ impl BitWriter {
 
     /// Get current output length in bytes (including partial byte)
     pub fn len(&self) -> usize {
-        self.output.len() + if self.bits_in_byte > 0 { 1 } else { 0 }
+        self.output.len() + if self.bits_in_buffer > 0 { 1 } else { 0 }
     }
 
     /// Check if empty
     pub fn is_empty(&self) -> bool {
-        self.output.is_empty() && self.bits_in_byte == 0
+        self.output.is_empty() && self.bits_in_buffer == 0
     }
 
     /// Peek at output without consuming
@@ -126,8 +128,8 @@ impl BitWriter {
     /// Clear the writer for reuse
     pub fn clear(&mut self) {
         self.output.clear();
-        self.current_byte = 0;
-        self.bits_in_byte = 0;
+        self.buffer = 0;
+        self.bits_in_buffer = 0;
     }
 }
 

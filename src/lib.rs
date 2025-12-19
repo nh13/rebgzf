@@ -7,8 +7,8 @@ pub mod huffman;
 pub mod transcoder;
 
 pub use bgzf::{
-    is_bgzf, validate_bgzf_streaming, validate_bgzf_strict, BgzfValidation, GziEntry,
-    GziIndexBuilder,
+    is_bgzf, validate_bgzf_streaming, validate_bgzf_strict, verify_bgzf, BgzfValidation,
+    BgzfVerification, GziEntry, GziIndexBuilder,
 };
 pub use deflate::tokens::LZ77Token;
 pub use error::{Error, Result};
