@@ -146,7 +146,8 @@ impl ParallelTranscoder {
         loop {
             // Process all DEFLATE blocks in current gzip member
             while let Some(deflate_block) = parser.parse_block()? {
-                for token in deflate_block.tokens.iter() {
+                // Take ownership of tokens to avoid cloning
+                for token in deflate_block.tokens {
                     if matches!(token, LZ77Token::EndOfBlock) {
                         continue;
                     }
@@ -208,7 +209,8 @@ impl ParallelTranscoder {
                         pending_uncompressed_size = 0;
                     }
 
-                    pending_tokens.push(token.clone());
+                    // No clone needed - we own the token
+                    pending_tokens.push(token);
                     pending_uncompressed_size += token_size;
                 }
             }

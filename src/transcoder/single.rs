@@ -46,8 +46,8 @@ impl Transcoder for SingleThreadedTranscoder {
         loop {
             // Process all DEFLATE blocks in current gzip member
             while let Some(deflate_block) = parser.parse_block()? {
-                // Process each token from the DEFLATE block
-                for token in deflate_block.tokens.iter() {
+                // Process each token from the DEFLATE block (take ownership to avoid cloning)
+                for token in deflate_block.tokens {
                     // Skip EndOfBlock tokens from input
                     if matches!(token, LZ77Token::EndOfBlock) {
                         continue;
@@ -74,8 +74,8 @@ impl Transcoder for SingleThreadedTranscoder {
                         pending_uncompressed_size = 0;
                     }
 
-                    // Add token to pending
-                    pending_tokens.push(token.clone());
+                    // Add token to pending (no clone needed - we own the token)
+                    pending_tokens.push(token);
                     pending_uncompressed_size += token_size;
                 }
             }

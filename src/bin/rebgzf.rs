@@ -26,8 +26,8 @@ struct Args {
     #[arg(short = 't', long, default_value = "1")]
     threads: usize,
 
-    /// Use fixed Huffman tables (faster but slightly larger output)
-    #[arg(long, default_value = "true")]
+    /// Use fixed Huffman tables (currently always enabled; dynamic Huffman not yet implemented)
+    #[arg(long, hide = true)]
     fixed_huffman: bool,
 
     /// BGZF block size (default: 65280)

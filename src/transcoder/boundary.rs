@@ -6,8 +6,8 @@ use crate::deflate::tokens::LZ77Token;
 ///
 /// IMPORTANT: Tokens must be pre-resolved (no cross-boundary references).
 pub fn tokens_to_bytes(tokens: &[LZ77Token]) -> Vec<u8> {
-    // Estimate capacity: assume mostly literals with some compression
-    let mut output = Vec::with_capacity(tokens.len());
+    // Estimate capacity based on typical compression ratio
+    let mut output = Vec::with_capacity(tokens.len() * 2);
 
     for token in tokens {
         match token {
@@ -15,12 +15,13 @@ pub fn tokens_to_bytes(tokens: &[LZ77Token]) -> Vec<u8> {
                 output.push(*byte);
             }
             LZ77Token::Copy { length, distance } => {
-                // Replay the copy by looking back in output
-                let start = output.len().saturating_sub(*distance as usize);
-                for i in 0..*length as usize {
-                    // Handle overlapping copies (e.g., distance=1 repeats last byte)
-                    let byte = output[start + (i % *distance as usize)];
-                    output.push(byte);
+                let len = *length as usize;
+                let dist = *distance as usize;
+                let start = output.len() - dist;
+
+                // Handle both non-overlapping and RLE (overlapping) cases
+                for i in 0..len {
+                    output.push(output[start + (i % dist)]);
                 }
             }
             LZ77Token::EndOfBlock => {}
@@ -43,11 +44,19 @@ pub struct BoundaryResolver {
     /// Statistics
     refs_resolved: u64,
     refs_preserved: u64,
+    /// Reusable buffer for resolving Copy references (avoids allocation per Copy)
+    copy_buffer: Vec<u8>,
 }
 
 impl BoundaryResolver {
     pub fn new() -> Self {
-        Self { window: SlidingWindow::new(), position: 0, refs_resolved: 0, refs_preserved: 0 }
+        Self {
+            window: SlidingWindow::new(),
+            position: 0,
+            refs_resolved: 0,
+            refs_preserved: 0,
+            copy_buffer: Vec::with_capacity(258), // Max DEFLATE match length
+        }
     }
 
     /// Process tokens for a BGZF block (single-threaded mode).
@@ -83,30 +92,29 @@ impl BoundaryResolver {
                     // Check if reference crosses block boundary
                     let ref_start = self.position.saturating_sub(*distance as u64);
 
+                    // Reuse buffer to avoid allocation
+                    self.copy_buffer.clear();
+                    self.window.copy_to_vec(*distance, *length, &mut self.copy_buffer);
+
                     if ref_start < block_start {
-                        // Reference points to previous block - must resolve
-                        let resolved = self.resolve_copy(*length, *distance);
-                        for byte in &resolved {
-                            self.window.push_byte(*byte);
-                            output.push(LZ77Token::Literal(*byte));
+                        // Reference points to previous block - must resolve to literals
+                        for &byte in &self.copy_buffer {
+                            self.window.push_byte(byte);
+                            output.push(LZ77Token::Literal(byte));
                         }
-                        hasher.update(&resolved);
-                        uncompressed_size += *length as u32;
-                        self.position += *length as u64;
                         self.refs_resolved += 1;
                     } else {
                         // Reference stays within current block - preserve it
-                        // But we still need to update the window and compute CRC
-                        let resolved = self.resolve_copy(*length, *distance);
-                        for byte in &resolved {
-                            self.window.push_byte(*byte);
+                        for &byte in &self.copy_buffer {
+                            self.window.push_byte(byte);
                         }
-                        hasher.update(&resolved);
-                        uncompressed_size += *length as u32;
-                        self.position += *length as u64;
                         output.push(LZ77Token::Copy { length: *length, distance: *distance });
                         self.refs_preserved += 1;
                     }
+
+                    hasher.update(&self.copy_buffer);
+                    uncompressed_size += *length as u32;
+                    self.position += *length as u64;
                 }
 
                 LZ77Token::EndOfBlock => {
@@ -146,27 +154,28 @@ impl BoundaryResolver {
                 LZ77Token::Copy { length, distance } => {
                     let ref_start = self.position.saturating_sub(*distance as u64);
 
+                    // Reuse buffer to avoid allocation
+                    self.copy_buffer.clear();
+                    self.window.copy_to_vec(*distance, *length, &mut self.copy_buffer);
+
                     if ref_start < block_start {
                         // Must resolve cross-boundary reference
-                        let resolved = self.resolve_copy(*length, *distance);
-                        for byte in &resolved {
-                            self.window.push_byte(*byte);
-                            output.push(LZ77Token::Literal(*byte));
+                        for &byte in &self.copy_buffer {
+                            self.window.push_byte(byte);
+                            output.push(LZ77Token::Literal(byte));
                         }
-                        uncompressed_size += *length as u32;
-                        self.position += *length as u64;
                         self.refs_resolved += 1;
                     } else {
                         // Preserve within-block reference
-                        let resolved = self.resolve_copy(*length, *distance);
-                        for byte in &resolved {
-                            self.window.push_byte(*byte);
+                        for &byte in &self.copy_buffer {
+                            self.window.push_byte(byte);
                         }
-                        uncompressed_size += *length as u32;
-                        self.position += *length as u64;
                         output.push(LZ77Token::Copy { length: *length, distance: *distance });
                         self.refs_preserved += 1;
                     }
+
+                    uncompressed_size += *length as u32;
+                    self.position += *length as u64;
                 }
 
                 LZ77Token::EndOfBlock => {}
@@ -174,11 +183,6 @@ impl BoundaryResolver {
         }
 
         (output, uncompressed_size)
-    }
-
-    /// Resolve a Copy reference to literal bytes using the window
-    fn resolve_copy(&self, length: u16, distance: u16) -> Vec<u8> {
-        self.window.get(distance, length)
     }
 
     /// Get the current position in uncompressed stream
@@ -197,6 +201,7 @@ impl BoundaryResolver {
         self.position = 0;
         self.refs_resolved = 0;
         self.refs_preserved = 0;
+        self.copy_buffer.clear();
     }
 }
 

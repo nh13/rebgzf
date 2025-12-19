@@ -32,9 +32,18 @@ impl SlidingWindow {
     /// Note: distance=1 means the most recently written byte.
     /// Length can exceed distance (run-length encoding case).
     pub fn get(&self, distance: u16, length: u16) -> Vec<u8> {
+        let mut result = Vec::with_capacity(length as usize);
+        self.copy_to_vec(distance, length, &mut result);
+        result
+    }
+
+    /// Copy `length` bytes from `distance` bytes back into a pre-allocated Vec.
+    /// This avoids allocation when the caller can reuse a buffer.
+    #[inline]
+    pub fn copy_to_vec(&self, distance: u16, length: u16, out: &mut Vec<u8>) {
         debug_assert!((1..=32768).contains(&distance));
 
-        let mut result = Vec::with_capacity(length as usize);
+        let start_len = out.len();
 
         // Starting position in circular buffer
         // write_pos points to NEXT write location, so we go back (distance) from there
@@ -46,16 +55,50 @@ impl SlidingWindow {
         let mut read_pos = start;
         for i in 0..length as usize {
             if i < distance as usize {
-                result.push(self.buffer[read_pos]);
+                out.push(self.buffer[read_pos]);
                 read_pos = (read_pos + 1) & 0x7FFF;
             } else {
-                // RLE: copy from earlier in result
-                let rle_idx = i - (distance as usize);
-                result.push(result[rle_idx]);
+                // RLE: copy from earlier in output
+                let rle_idx = start_len + i - (distance as usize);
+                out.push(out[rle_idx]);
             }
         }
+    }
 
-        result
+    /// Process each byte from `distance` bytes back, calling the provided closure.
+    /// This avoids allocation entirely for cases where we just need to iterate.
+    #[inline]
+    pub fn for_each_byte<F: FnMut(u8)>(&self, distance: u16, length: u16, mut f: F) {
+        debug_assert!((1..=32768).contains(&distance));
+
+        let available = self.total_written.min(32768) as usize;
+        let start = (self.write_pos + 32768 - (distance as usize).min(available)) & 0x7FFF;
+
+        if length <= distance {
+            // Simple case: no RLE, just read from buffer
+            let mut read_pos = start;
+            for _ in 0..length {
+                f(self.buffer[read_pos]);
+                read_pos = (read_pos + 1) & 0x7FFF;
+            }
+        } else {
+            // RLE case: need to track what we've "produced"
+            // We need a small buffer for the pattern
+            let dist = distance as usize;
+            let mut pattern = Vec::with_capacity(dist);
+
+            // First, get the pattern bytes
+            let mut read_pos = start;
+            for _ in 0..dist {
+                pattern.push(self.buffer[read_pos]);
+                read_pos = (read_pos + 1) & 0x7FFF;
+            }
+
+            // Now emit the pattern repeatedly
+            for i in 0..length as usize {
+                f(pattern[i % dist]);
+            }
+        }
     }
 
     /// Get available window size

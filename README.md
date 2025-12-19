@@ -32,7 +32,7 @@ Half-decompression is significantly faster than full decompress + recompress bec
 - Minimal memory footprint (just the sliding window)
 - Parallel encoding of independent blocks
 
-**Benchmark Results** (57 MB gzip → 208 MB uncompressed FASTQ):
+**Benchmark Results** (54 MB gzip → 80 MB BGZF, original data 208 MB uncompressed FASTQ):
 
 | Threads | Time  | Throughput  | Speedup |
 |---------|-------|-------------|---------|
@@ -43,6 +43,11 @@ Half-decompression is significantly faster than full decompress + recompress bec
 
 *Throughput measured on compressed input size. Tested on Apple M1.*
 
+**Output size:** BGZF output is typically ~1.5x larger than the original gzip because:
+- Each BGZF block has 26 bytes of overhead (header + footer)
+- Cross-boundary LZ77 references are expanded to literals
+- Fixed Huffman encoding (less optimal than original dynamic tables)
+
 **Why only 2 threads help:**
 
 The tool uses a producer-consumer architecture where the main thread sequentially parses DEFLATE blocks (this cannot be parallelized) while worker threads encode BGZF blocks in parallel. With 2 threads total:
@@ -51,9 +56,7 @@ The tool uses a producer-consumer architecture where the main thread sequentiall
 
 Additional threads beyond 2 provide **no benefit** because the main thread's sequential parsing is the bottleneck. The single worker can easily keep up with the parsing rate.
 
-**Trade-offs:**
-- Fixed Huffman encoding (default) is faster but produces larger output (~30% larger)
-- Best suited for format conversion pipelines where random access is needed
+**Trade-off:** BGZF files are larger than gzip, but enable random access. Best suited for format conversion pipelines where random access is needed
 
 ## Installation
 
@@ -105,7 +108,6 @@ Options:
   -i, --input <INPUT>            Input gzip file (use - for stdin)
   -o, --output <OUTPUT>          Output BGZF file (use - for stdout)
   -t, --threads <THREADS>        Number of threads (0 = auto, 1 = single-threaded) [default: 1]
-      --fixed-huffman            Use fixed Huffman tables (faster but slightly larger output)
       --block-size <BLOCK_SIZE>  BGZF block size (default: 65280) [default: 65280]
   -v, --verbose                  Show verbose statistics
       --check                    Check if input is BGZF and exit (0=BGZF, 1=not BGZF, 2=error)
@@ -193,9 +195,7 @@ When splitting into BGZF blocks, back-references may point across block boundari
 
 ### Re-encoding
 
-Tokens are re-encoded using:
-- **Fixed Huffman tables** (default): Faster encoding, slightly larger output
-- **Dynamic Huffman tables**: Better compression, slower encoding
+Tokens are re-encoded using **fixed Huffman tables** (RFC 1951 section 3.2.6). This avoids the overhead of computing optimal Huffman codes for each block while providing reasonable compression.
 
 ## Optimization Techniques
 
@@ -300,7 +300,6 @@ cargo bench
 Benchmarks compare:
 - Single-threaded vs parallel transcoding
 - Various block sizes
-- Fixed vs dynamic Huffman tables
 
 ## Testing
 
