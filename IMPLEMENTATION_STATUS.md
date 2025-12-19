@@ -17,10 +17,15 @@ A high-performance gzip-to-BGZF transcoder that re-encodes gzip streams into BGZ
 | Format detection | `--format fastq/auto/default` | ✓ Complete |
 | Dynamic Huffman encoding | Per-block optimal tables (levels 4+) | ✓ Complete |
 | Bulk bit refill | Reads 8 bytes at once for efficiency | ✓ Complete |
+| Bulk bit writing | 64-bit buffer for efficient output | ✓ Complete |
 | Progress tracking | `--progress` with throughput display | ✓ Complete |
 | FASTQ-aware splitting | Record-aligned block boundaries (levels 7+) | ✓ Complete |
 | GZI index output | `--index` for random access support | ✓ Complete |
 | Streaming validation | Validate BGZF from stdin/pipes | ✓ Complete |
+| Deep verification | `--verify` with CRC32 checking | ✓ Complete |
+| File statistics | `--stats` mode | ✓ Complete |
+| Quiet mode | `-q/--quiet` flag | ✓ Complete |
+| JSON output | `--json` for scripting | ✓ Complete |
 | Parallel transcoding | Multi-threaded encoding | ✓ Complete |
 | Concatenated gzip | Handle multi-member gzip files | ✓ Complete |
 

@@ -127,12 +127,16 @@ Options:
                                  7-9: dynamic + smart boundaries) [default: 1]
       --format <FORMAT>          Input format profile: default, fastq, auto [default: default]
       --block-size <BLOCK_SIZE>  BGZF block size (default: 65280) [default: 65280]
-      --index [PATH]             Write GZI index file (enables random access)
-  -p, --progress                 Show progress during transcoding
   -v, --verbose                  Show verbose statistics
+  -q, --quiet                    Quiet mode - suppress all output except errors
+      --json                     Output results as JSON (for scripting)
       --check                    Check if input is BGZF and exit (0=BGZF, 1=not BGZF, 2=error)
       --strict                   Validate all BGZF blocks (slower, more thorough)
+      --verify                   Verify BGZF by decompressing and checking CRC32
+      --stats                    Show file statistics without transcoding
       --force                    Force transcoding even if input is already BGZF
+  -p, --progress                 Show progress during transcoding
+      --index [PATH]             Write GZI index file (enables random access)
   -h, --help                     Print help
   -V, --version                  Print version
 ```
