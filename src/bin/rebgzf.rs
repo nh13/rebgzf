@@ -357,20 +357,24 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
     let progress_handle =
         progress_state.as_ref().map(|state| spawn_progress_thread(Arc::clone(state)));
 
-    // Open input for transcoding (with optional progress wrapper)
-    let input: Box<dyn Read> = if is_stdin {
-        if let Some(ref state) = progress_state {
+    // Open input for streaming transcoding (stdin or progress mode only).
+    // The mmap fast path (non-stdin, no progress) opens the file itself, so we
+    // avoid a redundant file handle here.
+    let input: Option<Box<dyn Read>> = if is_stdin {
+        Some(if let Some(ref state) = progress_state {
             Box::new(ProgressReader::new(io::stdin().lock(), Arc::clone(state)))
         } else {
             Box::new(io::stdin().lock())
-        }
-    } else {
+        })
+    } else if args.progress {
         let file = BufReader::new(File::open(&args.input)?);
-        if let Some(ref state) = progress_state {
-            Box::new(ProgressReader::new(file, Arc::clone(state)))
+        Some(if let Some(ref state) = progress_state {
+            Box::new(ProgressReader::new(file, Arc::clone(state))) as Box<dyn Read>
         } else {
             Box::new(file)
-        }
+        })
+    } else {
+        None
     };
 
     // Open output
@@ -383,12 +387,36 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
     // Run transcoder
     let start = std::time::Instant::now();
 
-    let stats = if config.num_threads == 1 {
+    let stats = if !is_stdin && !args.progress {
+        // Fast path: mmap input for file inputs
+        let file = File::open(&args.input)?;
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        #[cfg(unix)]
+        {
+            let ret = unsafe {
+                libc::madvise(mmap.as_ptr() as *mut libc::c_void, mmap.len(), libc::MADV_SEQUENTIAL)
+            };
+            if ret != 0 && args.verbose {
+                eprintln!(
+                    "Warning: madvise(MADV_SEQUENTIAL) failed: {}",
+                    io::Error::last_os_error()
+                );
+            }
+        }
+        if config.num_threads == 1 {
+            let mut transcoder = SingleThreadedTranscoder::new(config);
+            transcoder.transcode_slice(&mmap, output)?
+        } else {
+            // Parallel DEFLATE decode + BGZF encode
+            let mut transcoder = ParallelDecodeTranscoder::new(config);
+            transcoder.transcode_mmap(&mmap, output)?
+        }
+    } else if config.num_threads == 1 {
         let mut transcoder = SingleThreadedTranscoder::new(config);
-        transcoder.transcode(input, output)?
+        transcoder.transcode(input.expect("input must be set for streaming path"), output)?
     } else {
         let mut transcoder = ParallelTranscoder::new(config);
-        transcoder.transcode(input, output)?
+        transcoder.transcode(input.expect("input must be set for streaming path"), output)?
     };
 
     let elapsed = start.elapsed();

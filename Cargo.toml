@@ -36,6 +36,8 @@ thiserror = "1.0"
 
 # CLI
 clap = { version = "4.4", features = ["derive"] }
+memmap2 = "0.9.10"
+libc = "0.2.183"
 
 [dev-dependencies]
 # For testing against reference implementations

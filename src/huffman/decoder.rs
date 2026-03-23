@@ -1,10 +1,11 @@
-use crate::bits::BitReader;
+use crate::bits::BitRead;
 use crate::error::{Error, Result};
-use std::io::Read;
 
-/// Number of bits for the primary lookup table
-/// 10 bits = 1024 entries, covers most DEFLATE codes efficiently
-const LOOKUP_BITS: u8 = 10;
+/// Number of bits for the primary lookup table.
+/// 12 bits = 4096 entries (8KB), fits in L1 cache.
+/// Larger table means fewer slow-path fallbacks for codes >10 bits.
+/// In practice, >99% of DEFLATE codes resolve in one lookup with 12 bits.
+const LOOKUP_BITS: u8 = 12;
 const LOOKUP_SIZE: usize = 1 << LOOKUP_BITS;
 
 /// Entry in the lookup table
@@ -149,19 +150,18 @@ impl HuffmanDecoder {
     }
 
     /// Decode next symbol from bitstream using table lookup with fallback
-    #[inline]
-    pub fn decode<R: Read>(&self, bits: &mut BitReader<R>) -> Result<u16> {
-        if self.max_bits == 0 {
-            return Err(Error::HuffmanIncomplete);
-        }
-
-        // Fast path: try to peek LOOKUP_BITS and do table lookup
-        // If we can't peek enough bits (near EOF), fall back to slow path
+    #[inline(always)]
+    pub fn decode<B: BitRead>(&self, bits: &mut B) -> Result<u16> {
+        // Fast path: peek LOOKUP_BITS and do table lookup
+        // peek_bits returns Err only near EOF (rare)
         if let Ok(peek) = bits.peek_bits(LOOKUP_BITS) {
-            let entry = self.lookup[peek as usize];
+            // Mask to LOOKUP_BITS to guarantee index < LOOKUP_SIZE, regardless of
+            // whether the BitRead implementation correctly bounds its return value.
+            let idx = (peek as usize) & (LOOKUP_SIZE - 1);
+            // Safety: idx < LOOKUP_SIZE is guaranteed by the mask above.
+            let entry = unsafe { *self.lookup.get_unchecked(idx) };
 
             if entry.is_valid() {
-                // Found it! Consume exactly the code length bits
                 bits.consume_bits(entry.length());
                 return Ok(entry.symbol());
             }
@@ -173,7 +173,7 @@ impl HuffmanDecoder {
 
     /// Slow path for codes longer than LOOKUP_BITS
     #[cold]
-    fn decode_slow<R: Read>(&self, bits: &mut BitReader<R>) -> Result<u16> {
+    fn decode_slow<B: BitRead>(&self, bits: &mut B) -> Result<u16> {
         let mut code = 0u32;
         for len in 1..=self.max_bits {
             code = (code << 1) | bits.read_bits(1)?;
@@ -216,6 +216,7 @@ fn reverse_bits(value: u32, n: u8) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bits::BitReader;
     use std::io::Cursor;
 
     #[test]
@@ -256,9 +257,9 @@ mod tests {
         assert_eq!(entry.length(), 8);
         assert!(entry.is_valid());
 
-        let entry2 = LookupEntry::new(100, 12);
+        let entry2 = LookupEntry::new(100, 14);
         assert_eq!(entry2.symbol(), 100);
-        assert_eq!(entry2.length(), 12);
+        assert_eq!(entry2.length(), 14);
         assert!(!entry2.is_valid()); // > LOOKUP_BITS
     }
 
