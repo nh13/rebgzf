@@ -13,10 +13,11 @@ impl SlidingWindow {
     }
 
     /// Add a single byte to the window
-    #[inline]
+    #[inline(always)]
     pub fn push_byte(&mut self, byte: u8) {
-        self.buffer[self.write_pos] = byte;
-        self.write_pos = (self.write_pos + 1) & 0x7FFF; // mod 32768
+        // Safety: write_pos is always masked to 0x7FFF, so always < 32768
+        unsafe { *self.buffer.get_unchecked_mut(self.write_pos) = byte };
+        self.write_pos = (self.write_pos + 1) & 0x7FFF;
         self.total_written += 1;
     }
 
@@ -53,14 +54,16 @@ impl SlidingWindow {
         // Handle the RLE case: distance < length
         // We read byte-by-byte, handling wrap-around
         let mut read_pos = start;
+        let dist = distance as usize;
         for i in 0..length as usize {
-            if i < distance as usize {
-                out.push(self.buffer[read_pos]);
+            if i < dist {
+                // Safety: read_pos is always masked to 0x7FFF, so always < 32768
+                out.push(unsafe { *self.buffer.get_unchecked(read_pos) });
                 read_pos = (read_pos + 1) & 0x7FFF;
             } else {
                 // RLE: copy from earlier in output
-                let rle_idx = start_len + i - (distance as usize);
-                out.push(out[rle_idx]);
+                let rle_idx = start_len + i - dist;
+                out.push(unsafe { *out.get_unchecked(rle_idx) });
             }
         }
     }

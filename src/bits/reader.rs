@@ -1,10 +1,14 @@
+use crate::bits::traits::BitRead;
 use crate::error::{Error, Result};
 use std::io::Read;
 
-/// Bit-level reader for DEFLATE streams
+/// Bit-level reader for DEFLATE streams backed by a `Read` source.
 ///
 /// DEFLATE uses LSB-first bit ordering within bytes.
 /// Bits are read from LSB to MSB within each byte.
+///
+/// For higher performance on file inputs, prefer `SliceBitReader` which
+/// operates on a memory-mapped byte slice with branchless refill.
 pub struct BitReader<R: Read> {
     reader: R,
     /// Buffer holding up to 64 bits
@@ -182,6 +186,36 @@ impl<R: Read> BitReader<R> {
     /// Get the inner reader (consumes self)
     pub fn into_inner(self) -> R {
         self.reader
+    }
+}
+
+impl<R: Read> BitRead for BitReader<R> {
+    #[inline]
+    fn fill_buffer(&mut self, n: u8) -> Result<()> {
+        self.fill_buffer(n)
+    }
+
+    #[inline]
+    fn read_bits(&mut self, n: u8) -> Result<u32> {
+        self.read_bits(n)
+    }
+
+    #[inline]
+    fn peek_bits(&mut self, n: u8) -> Result<u32> {
+        self.peek_bits(n)
+    }
+
+    #[inline]
+    fn consume_bits(&mut self, n: u8) {
+        self.consume_bits(n)
+    }
+
+    fn align_to_byte(&mut self) {
+        self.align_to_byte()
+    }
+
+    fn bytes_read(&self) -> u64 {
+        self.bytes_read
     }
 }
 

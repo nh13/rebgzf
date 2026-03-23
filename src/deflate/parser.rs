@@ -1,22 +1,134 @@
 use super::tables::{CODE_LENGTH_ORDER, DISTANCE_TABLE, LENGTH_TABLE};
 use super::tokens::{CodeLengths, LZ77Block, LZ77Token};
-use crate::bits::BitReader;
+use crate::bits::{BitRead, BitReader, SliceBitReader};
 use crate::error::{Error, Result};
 use crate::huffman::HuffmanDecoder;
 use std::io::Read;
 
-/// Parses DEFLATE blocks and extracts LZ77 stream
-pub struct DeflateParser<R: Read> {
-    bits: BitReader<R>,
+/// Parses DEFLATE blocks and extracts LZ77 stream.
+///
+/// Generic over the bit reader type to support both stream-based (`BitReader<R>`)
+/// and slice-based (`SliceBitReader`) inputs.
+pub struct DeflateParser<B: BitRead> {
+    bits: B,
     /// Whether we've seen the final block
     finished: bool,
 }
 
-impl<R: Read> DeflateParser<R> {
+impl<R: Read> DeflateParser<BitReader<R>> {
+    /// Create a parser from a `Read` source (stdin, network, etc.)
     pub fn new(reader: R) -> Self {
         Self { bits: BitReader::new(reader), finished: false }
     }
+}
 
+impl<'a> DeflateParser<SliceBitReader<'a>> {
+    /// Create a parser from a byte slice (e.g., mmap'd file).
+    /// `offset` is the byte position where DEFLATE data starts (after gzip header).
+    pub fn from_slice(data: &'a [u8], offset: usize) -> Self {
+        let mut bits = SliceBitReader::new(data);
+        bits.set_position(offset);
+        Self { bits, finished: false }
+    }
+}
+
+/// Internal helper: parse dynamic Huffman tables and also return the raw code length vecs.
+///
+/// Returns `(lit_lengths, dist_lengths, lit_decoder, dist_decoder)`.
+#[allow(clippy::type_complexity)]
+fn parse_dynamic_huffman_tables_inner<B: BitRead>(
+    bits: &mut B,
+) -> Result<(Vec<u8>, Vec<u8>, HuffmanDecoder, Option<HuffmanDecoder>)> {
+    // Read header
+    let hlit = bits.read_bits(5)? as usize + 257; // # of literal/length codes
+    let hdist = bits.read_bits(5)? as usize + 1; // # of distance codes
+    let hclen = bits.read_bits(4)? as usize + 4; // # of code length codes
+
+    // Read code length code lengths
+    let mut code_length_lengths = [0u8; 19];
+    for i in 0..hclen {
+        code_length_lengths[CODE_LENGTH_ORDER[i]] = bits.read_bits(3)? as u8;
+    }
+
+    // Build code length decoder
+    let code_length_decoder = HuffmanDecoder::from_code_lengths(&code_length_lengths)?;
+
+    // Decode literal/length and distance code lengths
+    let total_codes = hlit + hdist;
+    let mut all_lengths = Vec::with_capacity(total_codes);
+
+    while all_lengths.len() < total_codes {
+        let sym = code_length_decoder.decode(bits)?;
+
+        match sym {
+            0..=15 => {
+                // Literal code length
+                all_lengths.push(sym as u8);
+            }
+            16 => {
+                // Copy previous code length 3-6 times
+                let repeat = bits.read_bits(2)? as usize + 3;
+                let prev = *all_lengths.last().ok_or(Error::HuffmanIncomplete)?;
+                if all_lengths.len() + repeat > total_codes {
+                    return Err(Error::HuffmanIncomplete);
+                }
+                for _ in 0..repeat {
+                    all_lengths.push(prev);
+                }
+            }
+            17 => {
+                // Repeat zero 3-10 times
+                let repeat = bits.read_bits(3)? as usize + 3;
+                if all_lengths.len() + repeat > total_codes {
+                    return Err(Error::HuffmanIncomplete);
+                }
+                all_lengths.resize(all_lengths.len() + repeat, 0);
+            }
+            18 => {
+                // Repeat zero 11-138 times
+                let repeat = bits.read_bits(7)? as usize + 11;
+                if all_lengths.len() + repeat > total_codes {
+                    return Err(Error::HuffmanIncomplete);
+                }
+                all_lengths.resize(all_lengths.len() + repeat, 0);
+            }
+            _ => return Err(Error::InvalidHuffmanSymbol(sym)),
+        }
+    }
+
+    // Split into literal/length and distance lengths
+    let literal_lengths: Vec<u8> = all_lengths[..hlit].to_vec();
+    let distance_lengths: Vec<u8> = all_lengths[hlit..].to_vec();
+
+    // Build decoders
+    let lit_decoder = HuffmanDecoder::from_code_lengths(&literal_lengths)?;
+    let dist_decoder = if distance_lengths.iter().all(|&l| l == 0) {
+        // No distance codes - this is valid for blocks with only literals
+        None
+    } else {
+        Some(HuffmanDecoder::from_code_lengths(&distance_lengths)?)
+    };
+
+    Ok((literal_lengths, distance_lengths, lit_decoder, dist_decoder))
+}
+
+/// Parse the dynamic Huffman tables from a DEFLATE block header.
+///
+/// Reads HLIT, HDIST, HCLEN, the code length code lengths, and the full code length
+/// sequence from `bits`, then builds and returns `(lit_decoder, dist_decoder)`.
+///
+/// `dist_decoder` is `None` when the distance code lengths are all zero (literal-only blocks).
+///
+/// The caller is responsible for having already consumed the BFINAL and BTYPE bits before
+/// calling this function.
+pub fn parse_dynamic_huffman_tables<B: BitRead>(
+    bits: &mut B,
+) -> Result<(HuffmanDecoder, Option<HuffmanDecoder>)> {
+    let (_, _, lit_decoder, dist_decoder) = parse_dynamic_huffman_tables_inner(bits)?;
+    Ok((lit_decoder, dist_decoder))
+}
+
+impl<B: BitRead> DeflateParser<B> {
     /// Parse the next DEFLATE block, returning LZ77 tokens
     /// Returns None when stream is exhausted
     pub fn parse_block(&mut self) -> Result<Option<LZ77Block>> {
@@ -77,66 +189,8 @@ impl<R: Read> DeflateParser<R> {
 
     /// Parse a block with dynamic Huffman codes
     fn parse_dynamic_block(&mut self, is_final: bool) -> Result<LZ77Block> {
-        // Read header
-        let hlit = self.bits.read_bits(5)? as usize + 257; // # of literal/length codes
-        let hdist = self.bits.read_bits(5)? as usize + 1; // # of distance codes
-        let hclen = self.bits.read_bits(4)? as usize + 4; // # of code length codes
-
-        // Read code length code lengths
-        let mut code_length_lengths = [0u8; 19];
-        for i in 0..hclen {
-            code_length_lengths[CODE_LENGTH_ORDER[i]] = self.bits.read_bits(3)? as u8;
-        }
-
-        // Build code length decoder
-        let code_length_decoder = HuffmanDecoder::from_code_lengths(&code_length_lengths)?;
-
-        // Decode literal/length and distance code lengths
-        let total_codes = hlit + hdist;
-        let mut all_lengths = Vec::with_capacity(total_codes);
-
-        while all_lengths.len() < total_codes {
-            let sym = code_length_decoder.decode(&mut self.bits)?;
-
-            match sym {
-                0..=15 => {
-                    // Literal code length
-                    all_lengths.push(sym as u8);
-                }
-                16 => {
-                    // Copy previous code length 3-6 times
-                    let repeat = self.bits.read_bits(2)? as usize + 3;
-                    let prev = *all_lengths.last().ok_or(Error::HuffmanIncomplete)?;
-                    for _ in 0..repeat {
-                        all_lengths.push(prev);
-                    }
-                }
-                17 => {
-                    // Repeat zero 3-10 times
-                    let repeat = self.bits.read_bits(3)? as usize + 3;
-                    all_lengths.resize(all_lengths.len() + repeat, 0);
-                }
-                18 => {
-                    // Repeat zero 11-138 times
-                    let repeat = self.bits.read_bits(7)? as usize + 11;
-                    all_lengths.resize(all_lengths.len() + repeat, 0);
-                }
-                _ => return Err(Error::InvalidHuffmanSymbol(sym)),
-            }
-        }
-
-        // Split into literal/length and distance lengths
-        let literal_lengths: Vec<u8> = all_lengths[..hlit].to_vec();
-        let distance_lengths: Vec<u8> = all_lengths[hlit..].to_vec();
-
-        // Build decoders
-        let lit_decoder = HuffmanDecoder::from_code_lengths(&literal_lengths)?;
-        let dist_decoder = if distance_lengths.iter().all(|&l| l == 0) {
-            // No distance codes - this is valid for blocks with only literals
-            None
-        } else {
-            Some(HuffmanDecoder::from_code_lengths(&distance_lengths)?)
-        };
+        let (literal_lengths, distance_lengths, lit_decoder, dist_decoder) =
+            parse_dynamic_huffman_tables_inner(&mut self.bits)?;
 
         // Decode symbols
         let tokens = self.decode_symbols_with_optional_dist(&lit_decoder, dist_decoder.as_ref())?;
@@ -147,63 +201,88 @@ impl<R: Read> DeflateParser<R> {
         Ok(block)
     }
 
-    /// Decode symbols using literal/length and distance decoders
+    /// Decode symbols using literal/length and distance decoders.
+    /// This is the hot path — called for every DEFLATE block.
+    #[inline(never)] // Prevent inlining into parse_block to keep it in its own hot function
     fn decode_symbols(
         &mut self,
         lit_decoder: &HuffmanDecoder,
         dist_decoder: &HuffmanDecoder,
     ) -> Result<Vec<LZ77Token>> {
-        self.decode_symbols_with_optional_dist(lit_decoder, Some(dist_decoder))
+        let mut tokens = Vec::with_capacity(8192);
+
+        loop {
+            let sym = lit_decoder.decode(&mut self.bits)?;
+
+            if sym <= 255 {
+                // Literal byte — most common case (~60% of symbols)
+                tokens.push(LZ77Token::Literal(sym as u8));
+                continue;
+            }
+
+            if sym == 256 {
+                // End of block
+                tokens.push(LZ77Token::EndOfBlock);
+                break;
+            }
+
+            // Length code (257..=285)
+            if sym > 285 {
+                return Err(Error::InvalidLengthCode(sym));
+            }
+
+            let len_idx = (sym - 257) as usize;
+            // Safety: len_idx is 0..28, LENGTH_TABLE has 29 entries
+            let (base_len, extra_bits) = unsafe { *LENGTH_TABLE.get_unchecked(len_idx) };
+            let extra = if extra_bits > 0 { self.bits.read_bits(extra_bits)? } else { 0 };
+            let length = base_len + extra as u16;
+
+            // Read distance
+            let dist_sym = dist_decoder.decode(&mut self.bits)?;
+            if dist_sym > 29 {
+                return Err(Error::InvalidDistanceCode(dist_sym));
+            }
+
+            // Safety: dist_sym <= 29, DISTANCE_TABLE has 30 entries
+            let (base_dist, dist_extra_bits) =
+                unsafe { *DISTANCE_TABLE.get_unchecked(dist_sym as usize) };
+            let dist_extra =
+                if dist_extra_bits > 0 { self.bits.read_bits(dist_extra_bits)? } else { 0 };
+            let distance = base_dist + dist_extra as u16;
+
+            tokens.push(LZ77Token::Copy { length, distance });
+        }
+
+        Ok(tokens)
     }
 
-    /// Decode symbols, optionally using a distance decoder
+    /// Decode symbols, optionally using a distance decoder (for blocks with no distance codes)
     fn decode_symbols_with_optional_dist(
         &mut self,
         lit_decoder: &HuffmanDecoder,
         dist_decoder: Option<&HuffmanDecoder>,
     ) -> Result<Vec<LZ77Token>> {
-        let mut tokens = Vec::with_capacity(1024);
+        // Fast path: if we have a distance decoder, use the optimized version
+        if let Some(dist_dec) = dist_decoder {
+            return self.decode_symbols(lit_decoder, dist_dec);
+        }
+
+        // Slow path: no distance decoder (rare — blocks with only literals)
+        let mut tokens = Vec::with_capacity(8192);
 
         loop {
             let sym = lit_decoder.decode(&mut self.bits)?;
 
             match sym {
-                0..=255 => {
-                    // Literal byte
-                    tokens.push(LZ77Token::Literal(sym as u8));
-                }
+                0..=255 => tokens.push(LZ77Token::Literal(sym as u8)),
                 256 => {
-                    // End of block
                     tokens.push(LZ77Token::EndOfBlock);
                     break;
                 }
                 257..=285 => {
-                    // Length code
-                    let len_idx = (sym - 257) as usize;
-                    let (base_len, extra_bits) = LENGTH_TABLE[len_idx];
-                    let extra = if extra_bits > 0 { self.bits.read_bits(extra_bits)? } else { 0 };
-                    let length = base_len + extra as u16;
-
-                    // Read distance
-                    let dist_decoder = dist_decoder.ok_or(Error::InvalidDistanceCode(0))?;
-                    let dist_sym = dist_decoder.decode(&mut self.bits)?;
-                    if dist_sym > 29 {
-                        return Err(Error::InvalidDistanceCode(dist_sym));
-                    }
-
-                    let (base_dist, dist_extra_bits) = DISTANCE_TABLE[dist_sym as usize];
-                    let dist_extra = if dist_extra_bits > 0 {
-                        self.bits.read_bits(dist_extra_bits)?
-                    } else {
-                        0
-                    };
-                    let distance = base_dist + dist_extra as u16;
-
-                    tokens.push(LZ77Token::Copy { length, distance });
+                    return Err(Error::InvalidDistanceCode(0));
                 }
-                _ => {
-                    return Err(Error::InvalidLengthCode(sym));
-                }
+                _ => return Err(Error::InvalidLengthCode(sym)),
             }
         }
 
@@ -221,7 +300,7 @@ impl<R: Read> DeflateParser<R> {
     }
 
     /// Get the underlying bit reader (for reading trailer)
-    pub fn into_inner(self) -> BitReader<R> {
+    pub fn into_inner(self) -> B {
         self.bits
     }
 
@@ -366,5 +445,25 @@ mod tests {
         }
 
         assert_eq!(total_size, 13);
+    }
+
+    #[test]
+    fn test_parse_dynamic_header_only() {
+        use std::io::Write;
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        // Use a longer, varied input that reliably produces a dynamic Huffman block
+        let input: Vec<u8> = (0u8..=127).cycle().take(512).collect();
+        encoder.write_all(&input).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut bits = SliceBitReader::new(&compressed);
+        let _bfinal = bits.read_bit().unwrap();
+        let btype = bits.read_bits(2).unwrap();
+        assert_eq!(btype, 2); // dynamic
+
+        let (lit_decoder, dist_decoder) = parse_dynamic_huffman_tables(&mut bits).unwrap();
+        assert!(!lit_decoder.is_empty());
+        let _ = dist_decoder;
     }
 }
