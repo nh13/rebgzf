@@ -12,7 +12,10 @@ pub use bgzf::{
 };
 pub use deflate::tokens::LZ77Token;
 pub use error::{Error, Result};
-pub use transcoder::{parallel::ParallelTranscoder, single::SingleThreadedTranscoder};
+pub use transcoder::{
+    parallel::ParallelTranscoder, parallel_decode::ParallelDecodeTranscoder,
+    single::SingleThreadedTranscoder,
+};
 
 use std::io::{Read, Write};
 use std::path::Path;
