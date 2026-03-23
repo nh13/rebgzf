@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use clap::{Parser, ValueEnum};
 use rebgzf::{
     is_bgzf, validate_bgzf_streaming, validate_bgzf_strict, verify_bgzf, BgzfValidation,
-    BgzfVerification, CompressionLevel, FormatProfile, ParallelTranscoder,
-    SingleThreadedTranscoder, TranscodeConfig, Transcoder,
+    BgzfVerification, CompressionLevel, FormatProfile, ParallelDecodeTranscoder,
+    ParallelTranscoder, SingleThreadedTranscoder, TranscodeConfig, Transcoder,
 };
 
 /// Format argument for CLI (maps to FormatProfile)
@@ -415,6 +415,7 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
         let mut transcoder = SingleThreadedTranscoder::new(config);
         transcoder.transcode(input.expect("input must be set for streaming path"), output)?
     } else {
+        // Fallback: parallel encoding only (for stdin/progress mode)
         let mut transcoder = ParallelTranscoder::new(config);
         transcoder.transcode(input.expect("input must be set for streaming path"), output)?
     };
