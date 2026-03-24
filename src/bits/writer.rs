@@ -140,7 +140,7 @@ impl Default for BitWriter {
 }
 
 /// Reverse the bottom `n` bits of `value`
-fn reverse_bits(value: u32, n: u8) -> u32 {
+pub(crate) fn reverse_bits(value: u32, n: u8) -> u32 {
     let mut result = 0u32;
     let mut v = value;
     for _ in 0..n {
