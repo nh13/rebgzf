@@ -171,10 +171,11 @@ impl Transcoder for SingleThreadedTranscoder {
     }
 }
 
-/// Emit a single BGZF block from pending tokens
+/// Emit a single BGZF block from pending tokens.
+/// Uses fused resolve+encode for fixed Huffman (one pass, no intermediate Vec).
 #[allow(clippy::too_many_arguments)]
 fn emit_block<W: Write>(
-    _config: &TranscodeConfig,
+    config: &TranscodeConfig,
     resolver: &mut BoundaryResolver,
     encoder: &mut HuffmanEncoder,
     bgzf_writer: &mut BgzfBlockWriter<W>,
@@ -183,8 +184,15 @@ fn emit_block<W: Write>(
     stats: &mut TranscodeStats,
     index_builder: &mut Option<GziIndexBuilder>,
 ) -> Result<()> {
-    let (resolved, crc, uncompressed_size) = resolver.resolve_block(block_start, tokens);
-    let deflate_data = encoder.encode(&resolved, true)?;
+    let (deflate_data, crc, uncompressed_size) = if config.use_fixed_huffman() {
+        // Fused path: resolve + encode in one pass (no intermediate token Vec)
+        resolver.resolve_and_encode_fixed(block_start, tokens, encoder)
+    } else {
+        // Two-pass path: resolve first, then encode (dynamic Huffman needs frequency pass)
+        let (resolved, crc, uncompressed_size) = resolver.resolve_block(block_start, tokens);
+        let deflate_data = encoder.encode(&resolved, true)?;
+        (deflate_data, crc, uncompressed_size)
+    };
 
     bgzf_writer.write_block_with_crc(&deflate_data, crc, uncompressed_size)?;
 

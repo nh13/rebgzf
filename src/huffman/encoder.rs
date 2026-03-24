@@ -357,6 +357,16 @@ impl HuffmanEncoder {
         Ok(writer.finish())
     }
 
+    /// Access fixed literal codes (for fused resolve+encode paths).
+    pub(crate) fn fixed_lit_codes(&self) -> &[(u32, u8)] {
+        &self.fixed_lit_codes
+    }
+
+    /// Access fixed distance codes (for fused resolve+encode paths).
+    pub(crate) fn fixed_dist_codes(&self) -> &[(u32, u8)] {
+        &self.fixed_dist_codes
+    }
+
     fn encode_fixed(&self, writer: &mut BitWriter, tokens: &[LZ77Token]) -> Result<()> {
         for token in tokens {
             match token {
