@@ -1,32 +1,89 @@
-use super::window::SlidingWindow;
 use crate::deflate::tokens::LZ77Token;
+
+/// Maximum LZ77 back-reference distance (32KB).
+const MAX_DISTANCE: usize = 32768;
 
 /// Resolves LZ77 back-references that cross BGZF block boundaries.
 ///
-/// The key insight: we only need to resolve references where the
-/// referenced data would be in a *previous* BGZF block. References
-/// within the same block can remain as Copy tokens.
+/// Uses a linear decode buffer instead of a circular sliding window.
+/// The buffer holds `[prev_tail: up to 32KB] [current_block: growing]`,
+/// enabling:
+/// - Simple array indexing for Copy lookups (no circular wrapping)
+/// - Single contiguous CRC hash per block (enables SIMD in crc32fast)
+/// - Bulk memcpy for non-RLE Copies
 pub struct BoundaryResolver {
-    /// 32KB sliding window of resolved (uncompressed) bytes
-    window: SlidingWindow,
+    /// Linear buffer: previous block tail + current block's decoded bytes.
+    /// Layout: `[0..tail_len] = previous block's last 32KB`
+    ///         `[tail_len..tail_len+current_len] = current block's bytes`
+    decode_buf: Vec<u8>,
+    /// Length of the previous-block tail portion (0..=32768)
+    tail_len: usize,
+    /// Current block's decoded byte count (bytes written past tail_len)
+    current_len: usize,
     /// Current position in the uncompressed stream
     position: u64,
     /// Statistics
     refs_resolved: u64,
     refs_preserved: u64,
-    /// Reusable buffer for resolving Copy references (avoids allocation per Copy)
-    copy_buffer: Vec<u8>,
 }
 
 impl BoundaryResolver {
     pub fn new() -> Self {
+        // Pre-allocate for typical BGZF block: 32KB tail + ~72KB block
         Self {
-            window: SlidingWindow::new(),
+            decode_buf: Vec::with_capacity(MAX_DISTANCE + 72 * 1024),
+            tail_len: 0,
+            current_len: 0,
             position: 0,
             refs_resolved: 0,
             refs_preserved: 0,
-            copy_buffer: Vec::with_capacity(258), // Max DEFLATE match length
         }
+    }
+
+    /// Append a byte to the current block region of the decode buffer.
+    #[inline(always)]
+    fn push_byte(&mut self, byte: u8) {
+        self.decode_buf.push(byte);
+        self.current_len += 1;
+    }
+
+    /// Copy `length` bytes from `distance` bytes back in the decode buffer.
+    /// Handles both non-RLE (distance >= length) and RLE (distance < length) cases.
+    #[inline]
+    fn copy_from_back(&mut self, distance: u16, length: u16) {
+        let dist = distance as usize;
+        let len = length as usize;
+        let src_start = self.decode_buf.len() - dist;
+
+        if dist >= len {
+            // Non-RLE: source doesn't overlap destination, bulk copy
+            // We must extend first, then copy (can't extend_from_within for overlapping)
+            let old_len = self.decode_buf.len();
+            self.decode_buf.resize(old_len + len, 0);
+            self.decode_buf.copy_within(src_start..src_start + len, old_len);
+        } else {
+            // RLE: source overlaps destination, byte-by-byte with pattern repeat
+            self.decode_buf.reserve(len);
+            for i in 0..len {
+                let byte = self.decode_buf[src_start + (i % dist)];
+                self.decode_buf.push(byte);
+            }
+        }
+        self.current_len += len;
+    }
+
+    /// Prepare for the next block: shift the last 32KB of decoded data
+    /// to become the tail for the next block's lookups.
+    fn rotate_tail(&mut self) {
+        let total = self.decode_buf.len();
+        let keep = total.min(MAX_DISTANCE);
+        if keep < total {
+            // Shift the last `keep` bytes to the front
+            self.decode_buf.copy_within(total - keep..total, 0);
+            self.decode_buf.truncate(keep);
+        }
+        self.tail_len = keep;
+        self.current_len = 0;
     }
 
     /// Process tokens for a BGZF block, resolving cross-boundary LZ77 references.
@@ -41,39 +98,36 @@ impl BoundaryResolver {
         tokens: &[LZ77Token],
     ) -> (Vec<LZ77Token>, u32, u32) {
         let mut output = Vec::with_capacity(tokens.len());
-        let mut hasher = crc32fast::Hasher::new();
-        let mut uncompressed_size: u32 = 0;
 
         for token in tokens {
             match token {
                 LZ77Token::Literal(byte) => {
-                    self.window.push_byte(*byte);
+                    self.push_byte(*byte);
                     self.position += 1;
                     output.push(LZ77Token::Literal(*byte));
-                    hasher.update(&[*byte]);
-                    uncompressed_size += 1;
                 }
 
                 LZ77Token::Copy { length, distance } => {
                     let ref_start = self.position.saturating_sub(*distance as u64);
 
-                    self.copy_buffer.clear();
-                    self.window.copy_to_vec(*distance, *length, &mut self.copy_buffer);
-
                     if ref_start < block_start {
-                        for &byte in &self.copy_buffer {
+                        // Cross-boundary: resolve to literals
+                        let dist = *distance as usize;
+                        let len = *length as usize;
+                        let src_start = self.decode_buf.len() - dist;
+                        for i in 0..len {
+                            let byte = self.decode_buf[src_start + (i % dist)];
+                            self.push_byte(byte);
                             output.push(LZ77Token::Literal(byte));
                         }
-                        self.window.push_bytes(&self.copy_buffer);
                         self.refs_resolved += 1;
                     } else {
-                        self.window.push_bytes(&self.copy_buffer);
+                        // Within-block: preserve Copy, append decoded bytes
+                        self.copy_from_back(*distance, *length);
                         output.push(LZ77Token::Copy { length: *length, distance: *distance });
                         self.refs_preserved += 1;
                     }
 
-                    hasher.update(&self.copy_buffer);
-                    uncompressed_size += *length as u32;
                     self.position += *length as u64;
                 }
 
@@ -81,7 +135,15 @@ impl BoundaryResolver {
             }
         }
 
-        (output, hasher.finalize(), uncompressed_size)
+        // CRC over the current block's contiguous bytes — one SIMD-friendly call
+        let block_bytes = &self.decode_buf[self.tail_len..self.tail_len + self.current_len];
+        let crc = crc32fast::hash(block_bytes);
+        let uncompressed_size = self.current_len as u32;
+
+        // Rotate: keep last 32KB as tail for next block
+        self.rotate_tail();
+
+        (output, crc, uncompressed_size)
     }
 
     /// Get the current position in uncompressed stream
@@ -96,11 +158,12 @@ impl BoundaryResolver {
 
     /// Reset the resolver
     pub fn reset(&mut self) {
-        self.window.clear();
+        self.decode_buf.clear();
+        self.tail_len = 0;
+        self.current_len = 0;
         self.position = 0;
         self.refs_resolved = 0;
         self.refs_preserved = 0;
-        self.copy_buffer.clear();
     }
 }
 
