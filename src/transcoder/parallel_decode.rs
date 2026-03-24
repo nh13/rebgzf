@@ -58,18 +58,43 @@ impl ParallelDecodeTranscoder {
 
     /// Transcode from a memory-mapped gzip byte slice to a writer.
     ///
-    /// Combined scan+decode approach (rapidgzip-style):
-    /// Each thread scans for candidate block boundaries AND decodes from them.
-    /// If decoding from a candidate fails or produces too few tokens, the thread
-    /// tries the next candidate. This eliminates false positive boundaries.
-    ///
-    /// **Limitation**: assumes the input is a single-member gzip file. For multi-member
-    /// gzip (e.g. concatenated `.gz` files), `deflate_end = data.len() - 8` only locates
-    /// the trailer of the *last* member, causing the parallel decoder to treat intermediate
-    /// member boundaries as part of the DEFLATE stream. Multi-member files fall back to the
-    /// single-threaded transcoder (via `region < MIN_REGION_BYTES` or thread count 1),
-    /// which correctly handles multi-member via `read_trailer_and_check_next`.
+    /// Handles both single-member and multi-member (concatenated) gzip files.
+    /// Each member is processed independently through the parallel decode pipeline.
     pub fn transcode_mmap<W: Write>(&mut self, data: &[u8], output: W) -> Result<TranscodeStats> {
+        let members = find_gzip_members(data);
+
+        if members.len() <= 1 {
+            return self.transcode_single_member(data, output);
+        }
+
+        // Multi-member: process each member through the parallel pipeline.
+        // Each member is independent (no LZ77 refs cross member boundaries).
+        // Each produces its own BGZF EOF block, which is valid per the spec.
+        let mut writer = BufWriter::with_capacity(self.config.buffer_size, output);
+        let mut combined_stats = TranscodeStats::default();
+
+        for (i, &member_start) in members.iter().enumerate() {
+            let member_end = if i + 1 < members.len() { members[i + 1] } else { data.len() };
+            let member_data = &data[member_start..member_end];
+
+            let stats = self.transcode_single_member(member_data, &mut writer)?;
+
+            combined_stats.output_bytes += stats.output_bytes;
+            combined_stats.blocks_written += stats.blocks_written;
+            combined_stats.boundary_refs_resolved += stats.boundary_refs_resolved;
+        }
+
+        combined_stats.input_bytes = data.len() as u64;
+        writer.flush().map_err(Error::Io)?;
+        Ok(combined_stats)
+    }
+
+    /// Transcode a single gzip member from a byte slice.
+    fn transcode_single_member<W: Write>(
+        &mut self,
+        data: &[u8],
+        output: W,
+    ) -> Result<TranscodeStats> {
         let header_size = parse_gzip_header_size(data)?;
         let deflate_end = data.len().saturating_sub(8);
         let num_threads = self.config.effective_threads();
@@ -81,11 +106,6 @@ impl ParallelDecodeTranscoder {
 
         let chunk_size = region / num_threads;
 
-        // Combined Phase 1+2: Each thread scans for a valid boundary and decodes.
-        // Thread 0 starts at the known DEFLATE start (no scanning needed).
-        // Phase 1+2+3: Parallel decode with streaming handoff to resolve+encode.
-        // Tokens are consumed in chunk order as they become available, keeping
-        // peak memory proportional to one chunk rather than the entire file.
         self.scan_and_decode_streaming(
             data,
             header_size,
@@ -263,7 +283,7 @@ impl ParallelDecodeTranscoder {
             next_write_id += 1;
         }
 
-        // Write EOF
+        // Write EOF block
         writer.write_all(&BGZF_EOF).map_err(Error::Io)?;
         output_bytes += 28;
         writer.flush().map_err(Error::Io)?;
@@ -389,6 +409,41 @@ impl ParallelDecodeTranscoder {
         let mut single = SingleThreadedTranscoder::new(self.config.clone());
         single.transcode_slice(data, output)
     }
+}
+
+/// Find the byte offsets of each gzip member in concatenated gzip data.
+/// Returns a vec with at least one entry (offset 0). Additional entries
+/// are found by scanning for valid gzip headers after each member's trailer.
+fn find_gzip_members(data: &[u8]) -> Vec<usize> {
+    let mut members = vec![0usize];
+    let mut pos = 0;
+
+    while let Ok(header_size) = parse_gzip_header_size(&data[pos..]) {
+
+        // Scan forward from the DEFLATE start for the next gzip magic.
+        // We can't know the exact member end without decompressing, but gzip
+        // members end with an 8-byte trailer (CRC32 + ISIZE) immediately
+        // followed by the next member's header (1f 8b). Scan for the magic.
+        let search_start = pos + header_size;
+        let mut found_next = false;
+        for i in search_start..data.len().saturating_sub(1) {
+            if data[i] == 0x1f && data[i + 1] == 0x8b {
+                // Validate this is actually a gzip header (not just coincidental bytes)
+                if parse_gzip_header_size(&data[i..]).is_ok() {
+                    members.push(i);
+                    pos = i;
+                    found_next = true;
+                    break;
+                }
+            }
+        }
+
+        if !found_next {
+            break;
+        }
+    }
+
+    members
 }
 
 /// Minimum tokens a probe decode must produce to accept a candidate boundary.
@@ -658,6 +713,78 @@ mod tests {
         let st_dec = gzip_decompress(&st_output);
         let pd_dec = gzip_decompress(&pd_output);
         assert_eq!(st_dec, pd_dec);
+    }
+
+    #[test]
+    fn test_multi_member_roundtrip() {
+        // Create two separate gzip members and concatenate them
+        let data1 = make_fastq(5_000);
+        let data2 = make_fastq(5_000);
+        let gz1 = gzip_compress(&data1);
+        let gz2 = gzip_compress(&data2);
+
+        let mut concat_gz = Vec::new();
+        concat_gz.extend_from_slice(&gz1);
+        concat_gz.extend_from_slice(&gz2);
+
+        let config = TranscodeConfig { num_threads: 4, ..Default::default() };
+        let mut transcoder = ParallelDecodeTranscoder::new(config).with_min_region_bytes(0);
+
+        let mut bgzf_output = Vec::new();
+        let stats = transcoder.transcode_mmap(&concat_gz, &mut bgzf_output).unwrap();
+
+        assert!(stats.blocks_written >= 2);
+
+        let decompressed = gzip_decompress(&bgzf_output);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&data1);
+        expected.extend_from_slice(&data2);
+        assert_eq!(decompressed, expected);
+    }
+
+    #[test]
+    fn test_multi_member_three_members() {
+        let data1 = make_fastq(3_000);
+        let data2 = make_fastq(4_000);
+        let data3 = make_fastq(3_000);
+
+        let mut concat_gz = Vec::new();
+        concat_gz.extend_from_slice(&gzip_compress(&data1));
+        concat_gz.extend_from_slice(&gzip_compress(&data2));
+        concat_gz.extend_from_slice(&gzip_compress(&data3));
+
+        let config = TranscodeConfig { num_threads: 4, ..Default::default() };
+        let mut transcoder = ParallelDecodeTranscoder::new(config).with_min_region_bytes(0);
+
+        let mut bgzf_output = Vec::new();
+        transcoder.transcode_mmap(&concat_gz, &mut bgzf_output).unwrap();
+
+        let decompressed = gzip_decompress(&bgzf_output);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&data1);
+        expected.extend_from_slice(&data2);
+        expected.extend_from_slice(&data3);
+        assert_eq!(decompressed, expected);
+    }
+
+    #[test]
+    fn test_find_gzip_members_single() {
+        let gz = gzip_compress(b"hello");
+        let members = find_gzip_members(&gz);
+        assert_eq!(members, vec![0]);
+    }
+
+    #[test]
+    fn test_find_gzip_members_multiple() {
+        let gz1 = gzip_compress(b"hello");
+        let gz2 = gzip_compress(b"world");
+        let mut concat = Vec::new();
+        concat.extend_from_slice(&gz1);
+        concat.extend_from_slice(&gz2);
+        let members = find_gzip_members(&concat);
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0], 0);
+        assert_eq!(members[1], gz1.len());
     }
 
     #[test]
