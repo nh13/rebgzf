@@ -89,25 +89,21 @@ impl BoundaryResolver {
                 }
 
                 LZ77Token::Copy { length, distance } => {
-                    // Check if reference crosses block boundary
                     let ref_start = self.position.saturating_sub(*distance as u64);
 
-                    // Reuse buffer to avoid allocation
                     self.copy_buffer.clear();
                     self.window.copy_to_vec(*distance, *length, &mut self.copy_buffer);
 
                     if ref_start < block_start {
-                        // Reference points to previous block - must resolve to literals
+                        // Cross-boundary: resolve to literals, then batch-update window.
                         for &byte in &self.copy_buffer {
-                            self.window.push_byte(byte);
                             output.push(LZ77Token::Literal(byte));
                         }
+                        self.window.push_bytes(&self.copy_buffer);
                         self.refs_resolved += 1;
                     } else {
-                        // Reference stays within current block - preserve it
-                        for &byte in &self.copy_buffer {
-                            self.window.push_byte(byte);
-                        }
+                        // Within-block: preserve Copy, batch-update window
+                        self.window.push_bytes(&self.copy_buffer);
                         output.push(LZ77Token::Copy { length: *length, distance: *distance });
                         self.refs_preserved += 1;
                     }
@@ -154,22 +150,17 @@ impl BoundaryResolver {
                 LZ77Token::Copy { length, distance } => {
                     let ref_start = self.position.saturating_sub(*distance as u64);
 
-                    // Reuse buffer to avoid allocation
                     self.copy_buffer.clear();
                     self.window.copy_to_vec(*distance, *length, &mut self.copy_buffer);
 
                     if ref_start < block_start {
-                        // Must resolve cross-boundary reference
                         for &byte in &self.copy_buffer {
-                            self.window.push_byte(byte);
                             output.push(LZ77Token::Literal(byte));
                         }
+                        self.window.push_bytes(&self.copy_buffer);
                         self.refs_resolved += 1;
                     } else {
-                        // Preserve within-block reference
-                        for &byte in &self.copy_buffer {
-                            self.window.push_byte(byte);
-                        }
+                        self.window.push_bytes(&self.copy_buffer);
                         output.push(LZ77Token::Copy { length: *length, distance: *distance });
                         self.refs_preserved += 1;
                     }

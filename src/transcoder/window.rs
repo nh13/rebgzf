@@ -21,11 +21,23 @@ impl SlidingWindow {
         self.total_written += 1;
     }
 
-    /// Add multiple bytes to the window
+    /// Add multiple bytes to the window efficiently using bulk copy.
+    ///
+    /// Handles inputs of any length, including those larger than the 32KB window.
     pub fn push_bytes(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.push_byte(b);
+        if bytes.is_empty() {
+            return;
         }
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let remaining = 32768 - self.write_pos;
+            let chunk_len = remaining.min(bytes.len() - offset);
+            self.buffer[self.write_pos..self.write_pos + chunk_len]
+                .copy_from_slice(&bytes[offset..offset + chunk_len]);
+            self.write_pos = (self.write_pos + chunk_len) & 0x7FFF;
+            offset += chunk_len;
+        }
+        self.total_written += bytes.len() as u64;
     }
 
     /// Get `length` bytes from `distance` bytes back
@@ -44,26 +56,40 @@ impl SlidingWindow {
     pub fn copy_to_vec(&self, distance: u16, length: u16, out: &mut Vec<u8>) {
         debug_assert!((1..=32768).contains(&distance));
 
-        let start_len = out.len();
-
-        // Starting position in circular buffer
-        // write_pos points to NEXT write location, so we go back (distance) from there
-        let available = self.total_written.min(32768) as usize;
-        let start = (self.write_pos + 32768 - (distance as usize).min(available)) & 0x7FFF;
-
-        // Handle the RLE case: distance < length
-        // We read byte-by-byte, handling wrap-around
-        let mut read_pos = start;
         let dist = distance as usize;
-        for i in 0..length as usize {
-            if i < dist {
-                // Safety: read_pos is always masked to 0x7FFF, so always < 32768
-                out.push(unsafe { *self.buffer.get_unchecked(read_pos) });
-                read_pos = (read_pos + 1) & 0x7FFF;
+        let len = length as usize;
+        let available = self.total_written.min(32768) as usize;
+        debug_assert!(
+            dist <= available,
+            "invalid back-reference: distance {dist} exceeds available window {available}"
+        );
+        let start = (self.write_pos + 32768 - dist) & 0x7FFF;
+
+        if dist >= len {
+            // Fast path: non-RLE, source doesn't overlap destination
+            out.reserve(len);
+            let end = start + len;
+            if end <= 32768 {
+                out.extend_from_slice(&self.buffer[start..end]);
             } else {
-                // RLE: copy from earlier in output
-                let rle_idx = start_len + i - dist;
-                out.push(unsafe { *out.get_unchecked(rle_idx) });
+                // Wraps around circular buffer
+                out.extend_from_slice(&self.buffer[start..]);
+                out.extend_from_slice(&self.buffer[..end & 0x7FFF]);
+            }
+        } else {
+            // RLE case: distance < length, must handle overlap byte-by-byte
+            let start_len = out.len();
+            let mut read_pos = start;
+            for i in 0..len {
+                if i < dist {
+                    // Safety: read_pos is always masked to 0x7FFF, so always < 32768
+                    out.push(unsafe { *self.buffer.get_unchecked(read_pos) });
+                    read_pos = (read_pos + 1) & 0x7FFF;
+                } else {
+                    // RLE: copy from earlier in output
+                    let rle_idx = start_len + i - dist;
+                    out.push(unsafe { *out.get_unchecked(rle_idx) });
+                }
             }
         }
     }
@@ -75,7 +101,12 @@ impl SlidingWindow {
         debug_assert!((1..=32768).contains(&distance));
 
         let available = self.total_written.min(32768) as usize;
-        let start = (self.write_pos + 32768 - (distance as usize).min(available)) & 0x7FFF;
+        debug_assert!(
+            (distance as usize) <= available,
+            "invalid back-reference: distance {} exceeds available window {available}",
+            distance
+        );
+        let start = (self.write_pos + 32768 - distance as usize) & 0x7FFF;
 
         if length <= distance {
             // Simple case: no RLE, just read from buffer
@@ -161,6 +192,60 @@ mod tests {
 
         // RLE case: distance=2, length=6 -> "ABABAB"
         assert_eq!(window.get(2, 6), vec![b'A', b'B', b'A', b'B', b'A', b'B']);
+    }
+
+    #[test]
+    fn test_push_bytes_bulk() {
+        let mut window = SlidingWindow::new();
+        window.push_bytes(b"ABCDEFGH");
+        assert_eq!(window.get(8, 8), b"ABCDEFGH");
+        assert_eq!(window.total_written(), 8);
+    }
+
+    #[test]
+    fn test_push_bytes_wrapping() {
+        let mut window = SlidingWindow::new();
+        // Fill to near end
+        for i in 0..32766u32 {
+            window.push_byte((i & 0xFF) as u8);
+        }
+        // Push 4 bytes that wrap around
+        window.push_bytes(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(window.get(4, 4), vec![0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(window.total_written(), 32770);
+    }
+
+    #[test]
+    fn test_copy_to_vec_non_rle_no_wrap() {
+        let mut window = SlidingWindow::new();
+        window.push_bytes(b"ABCDEFGH");
+        let mut out = Vec::new();
+        window.copy_to_vec(8, 4, &mut out);
+        assert_eq!(out, b"ABCD");
+    }
+
+    #[test]
+    fn test_copy_to_vec_non_rle_wrapping() {
+        let mut window = SlidingWindow::new();
+        for i in 0..32766u32 {
+            window.push_byte((i & 0xFF) as u8);
+        }
+        window.push_bytes(&[0xAA, 0xBB]);
+        let mut out = Vec::new();
+        window.copy_to_vec(2, 2, &mut out);
+        assert_eq!(out, vec![0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn test_push_bytes_larger_than_window() {
+        let mut window = SlidingWindow::new();
+        // Push more than 32KB in one call — should not panic
+        let data: Vec<u8> = (0..40000u32).map(|i| (i & 0xFF) as u8).collect();
+        window.push_bytes(&data);
+        assert_eq!(window.total_written(), 40000);
+        assert_eq!(window.available(), 32768);
+        // Most recent byte should be the last in data
+        assert_eq!(window.get(1, 1), vec![(39999 & 0xFF) as u8]);
     }
 
     #[test]
