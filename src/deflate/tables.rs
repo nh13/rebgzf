@@ -91,46 +91,98 @@ pub fn decode_distance(code: u16, extra_bits: u32) -> Option<u16> {
     Some(base + extra_bits as u16)
 }
 
-/// Reverse lookup: find length code from length value
-/// Returns (code, extra_value, extra_bits)
+/// Lookup table mapping length values (3..=258) to (code, extra_bits) pairs.
+/// Index by (length - 3). Built at compile time from LENGTH_TABLE.
+const LENGTH_ENCODE_TABLE: [(u16, u8); 256] = build_length_encode_table();
+
+const fn build_length_encode_table() -> [(u16, u8); 256] {
+    let mut table = [(0u16, 0u8); 256];
+    let mut i = 0;
+    while i < 29 {
+        let code = i as u16 + 257;
+        let (base, extra_bits) = LENGTH_TABLE[i];
+        let range = if extra_bits == 0 { 1u16 } else { 1 << extra_bits };
+        let mut j = 0u16;
+        while j < range && (base + j) <= 258 {
+            let idx = (base + j - 3) as usize;
+            if idx < 256 {
+                table[idx] = (code, extra_bits);
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    table
+}
+
+/// Reverse lookup: find length code from length value.
+/// Returns (code, extra_value, extra_bits).
+/// Uses O(1) table lookup instead of linear scan.
+#[inline]
 pub fn encode_length(length: u16) -> Option<(u16, u16, u8)> {
     if !(3..=258).contains(&length) {
         return None;
     }
-
     // Special case: length 258 uses code 285 (per RFC 1951)
     if length == 258 {
         return Some((285, 0, 0));
     }
-
-    for (i, &(base, extra_bits)) in LENGTH_TABLE.iter().enumerate() {
-        let code = (i as u16) + 257;
-        let max_len = if extra_bits == 0 { base } else { base + (1 << extra_bits) - 1 };
-
-        if length >= base && length <= max_len {
-            let extra_value = length - base;
-            return Some((code, extra_value, extra_bits));
-        }
-    }
-    None
+    let idx = (length - 3) as usize;
+    let (code, extra_bits) = LENGTH_ENCODE_TABLE[idx];
+    let base = LENGTH_TABLE[(code - 257) as usize].0;
+    Some((code, length - base, extra_bits))
 }
 
-/// Reverse lookup: find distance code from distance value
-/// Returns (code, extra_value, extra_bits)
+/// Lookup table mapping distance values (1..=32768) to distance codes.
+/// For distances <= 256, direct index. For larger, use leading-bit lookup.
+/// Returns (code, extra_bits).
+const DISTANCE_ENCODE_SMALL: [(u8, u8); 256] = build_distance_encode_small();
+
+const fn build_distance_encode_small() -> [(u8, u8); 256] {
+    let mut table = [(0u8, 0u8); 256];
+    let mut i = 0;
+    while i < 30 {
+        let (base, extra_bits) = DISTANCE_TABLE[i];
+        let range = if extra_bits == 0 { 1u16 } else { 1 << extra_bits };
+        let mut j = 0u16;
+        while j < range {
+            let dist = base + j;
+            if dist >= 1 && dist <= 256 {
+                table[(dist - 1) as usize] = (i as u8, extra_bits);
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    table
+}
+
+/// Reverse lookup: find distance code from distance value.
+/// Returns (code, extra_value, extra_bits).
+/// Uses O(1) table lookup for small distances, binary search for larger.
+#[inline]
 pub fn encode_distance(distance: u16) -> Option<(u16, u16, u8)> {
     if !(1..=32768).contains(&distance) {
         return None;
     }
-
-    for (code, &(base, extra_bits)) in DISTANCE_TABLE.iter().enumerate() {
-        let max_dist = if extra_bits == 0 { base } else { base + (1 << extra_bits) - 1 };
-
-        if distance >= base && distance <= max_dist {
-            let extra_value = distance - base;
-            return Some((code as u16, extra_value, extra_bits));
+    if distance <= 256 {
+        let (code, extra_bits) = DISTANCE_ENCODE_SMALL[(distance - 1) as usize];
+        let base = DISTANCE_TABLE[code as usize].0;
+        return Some((code as u16, distance - base, extra_bits));
+    }
+    // Binary search on DISTANCE_TABLE (30 entries, ~5 comparisons)
+    let mut lo = 0usize;
+    let mut hi = 29usize;
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        if DISTANCE_TABLE[mid].0 <= distance {
+            lo = mid;
+        } else {
+            hi = mid - 1;
         }
     }
-    None
+    let (base, extra_bits) = DISTANCE_TABLE[lo];
+    Some((lo as u16, distance - base, extra_bits))
 }
 
 #[cfg(test)]
