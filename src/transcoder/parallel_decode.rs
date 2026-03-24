@@ -16,7 +16,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use crossbeam::channel::{bounded, Receiver, Sender};
 
 use super::block_scanner::scan_for_block;
-use super::boundary::{tokens_to_bytes, BoundaryResolver};
+use super::boundary::BoundaryResolver;
 use super::single::{parse_gzip_header_size, SingleThreadedTranscoder};
 use super::splitter::{BlockSplitter, DefaultSplitter, FastqSplitter};
 use crate::bgzf::{GziEntry, BGZF_EOF};
@@ -156,13 +156,14 @@ impl ParallelDecodeTranscoder {
                 };
 
                 if should_emit {
-                    let (resolved, uncompressed_size) =
-                        resolver.resolve_block_for_parallel(block_start_position, &pending_tokens);
+                    let (resolved, crc, uncompressed_size) =
+                        resolver.resolve_block(block_start_position, &pending_tokens);
 
                     let job = EncodingJob {
                         block_id: next_block_id,
                         tokens: resolved,
                         uncompressed_size,
+                        crc,
                     };
                     next_block_id += 1;
 
@@ -196,9 +197,10 @@ impl ParallelDecodeTranscoder {
         // a blocking send here can deadlock if both channels are full and workers
         // are blocked on result_tx.send while the main thread blocks on job_tx.send)
         if !pending_tokens.is_empty() {
-            let (resolved, uncompressed_size) =
-                resolver.resolve_block_for_parallel(block_start_position, &pending_tokens);
-            let job = EncodingJob { block_id: next_block_id, tokens: resolved, uncompressed_size };
+            let (resolved, crc, uncompressed_size) =
+                resolver.resolve_block(block_start_position, &pending_tokens);
+            let job =
+                EncodingJob { block_id: next_block_id, tokens: resolved, uncompressed_size, crc };
             next_block_id += 1;
             send_job_and_drain(
                 &job_tx,
@@ -595,6 +597,7 @@ struct EncodingJob {
     block_id: u64,
     tokens: Vec<LZ77Token>,
     uncompressed_size: u32,
+    crc: u32,
 }
 
 /// Result from a worker: an encoded BGZF block ready to write.
@@ -604,7 +607,7 @@ struct EncodedBlock {
     uncompressed_size: u32,
 }
 
-/// Worker thread: receives resolved token blocks, computes CRC, encodes BGZF.
+/// Worker thread: receives resolved token blocks, encodes BGZF.
 fn encoding_worker(
     job_rx: Receiver<EncodingJob>,
     result_tx: Sender<Result<EncodedBlock>>,
@@ -613,8 +616,7 @@ fn encoding_worker(
     let mut encoder = HuffmanEncoder::new(use_fixed_huffman);
 
     while let Ok(job) = job_rx.recv() {
-        let uncompressed_bytes = tokens_to_bytes(&job.tokens);
-        let crc = crc32fast::hash(&uncompressed_bytes);
+        let crc = job.crc;
         let isize = job.uncompressed_size;
 
         let result = match encoder.encode(&job.tokens, true) {

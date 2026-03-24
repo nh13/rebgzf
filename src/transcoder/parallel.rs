@@ -10,7 +10,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 
 use crossbeam::channel::{bounded, Receiver, Sender};
 
-use super::boundary::{tokens_to_bytes, BoundaryResolver};
+use super::boundary::BoundaryResolver;
 use super::splitter::{BlockSplitter, DefaultSplitter, FastqSplitter};
 use crate::bgzf::{GziEntry, BGZF_EOF};
 use crate::deflate::{DeflateParser, LZ77Token};
@@ -27,6 +27,8 @@ struct EncodingJob {
     tokens: Vec<LZ77Token>,
     /// Uncompressed size (pre-computed during boundary resolution)
     uncompressed_size: u32,
+    /// CRC32 of uncompressed data (pre-computed during boundary resolution)
+    crc: u32,
 }
 
 /// Result of encoding a single BGZF block
@@ -197,14 +199,14 @@ impl ParallelTranscoder {
                     };
 
                     if should_emit {
-                        // Resolve boundaries only - workers will compute CRC in parallel
-                        let (resolved, uncompressed_size) = resolver
-                            .resolve_block_for_parallel(block_start_position, &pending_tokens);
+                        let (resolved, crc, uncompressed_size) =
+                            resolver.resolve_block(block_start_position, &pending_tokens);
 
                         let job = EncodingJob {
                             block_id: next_block_id,
                             tokens: resolved,
                             uncompressed_size,
+                            crc,
                         };
                         next_block_id += 1;
 
@@ -271,10 +273,11 @@ impl ParallelTranscoder {
 
         // Flush remaining tokens
         if !pending_tokens.is_empty() {
-            let (resolved, uncompressed_size) =
-                resolver.resolve_block_for_parallel(block_start_position, &pending_tokens);
+            let (resolved, crc, uncompressed_size) =
+                resolver.resolve_block(block_start_position, &pending_tokens);
 
-            let job = EncodingJob { block_id: next_block_id, tokens: resolved, uncompressed_size };
+            let job =
+                EncodingJob { block_id: next_block_id, tokens: resolved, uncompressed_size, crc };
             next_block_id += 1;
 
             let _ = job_tx.send(job);
@@ -440,9 +443,7 @@ fn worker_thread(
 
 /// Encode a single BGZF block
 fn encode_block(encoder: &mut HuffmanEncoder, job: EncodingJob) -> Result<EncodedBlock> {
-    // Compute CRC from tokens (parallelized - each worker does this)
-    let uncompressed_bytes = tokens_to_bytes(&job.tokens);
-    let crc = crc32fast::hash(&uncompressed_bytes);
+    let crc = job.crc;
     let isize = job.uncompressed_size;
 
     // Encode to DEFLATE
