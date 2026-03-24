@@ -362,13 +362,13 @@ impl HuffmanEncoder {
             match token {
                 LZ77Token::Literal(byte) => {
                     let (code, len) = self.fixed_lit_codes[*byte as usize];
-                    writer.write_bits_reversed(code, len);
+                    writer.write_bits(code, len);
                 }
                 LZ77Token::Copy { length, distance } => {
                     // Encode length
                     if let Some((len_code, extra_val, extra_bits)) = encode_length(*length) {
                         let (code, code_len) = self.fixed_lit_codes[len_code as usize];
-                        writer.write_bits_reversed(code, code_len);
+                        writer.write_bits(code, code_len);
                         if extra_bits > 0 {
                             writer.write_bits(extra_val as u32, extra_bits);
                         }
@@ -377,7 +377,7 @@ impl HuffmanEncoder {
                     // Encode distance
                     if let Some((dist_code, extra_val, extra_bits)) = encode_distance(*distance) {
                         let (code, code_len) = self.fixed_dist_codes[dist_code as usize];
-                        writer.write_bits_reversed(code, code_len);
+                        writer.write_bits(code, code_len);
                         if extra_bits > 0 {
                             writer.write_bits(extra_val as u32, extra_bits);
                         }
@@ -386,14 +386,14 @@ impl HuffmanEncoder {
                 LZ77Token::EndOfBlock => {
                     // Symbol 256 = end of block
                     let (code, len) = self.fixed_lit_codes[256];
-                    writer.write_bits_reversed(code, len);
+                    writer.write_bits(code, len);
                 }
             }
         }
 
         // Always write end of block
         let (code, len) = self.fixed_lit_codes[256];
-        writer.write_bits_reversed(code, len);
+        writer.write_bits(code, len);
 
         Ok(())
     }
@@ -439,7 +439,7 @@ impl HuffmanEncoder {
 
         // Write end of block
         let (code, len) = lit_codes[256];
-        writer.write_bits_reversed(code, len);
+        writer.write_bits(code, len);
 
         Ok(())
     }
@@ -494,7 +494,7 @@ impl HuffmanEncoder {
         // Write RLE-encoded literal/length and distance code lengths
         for &(sym, extra) in &rle_encoded {
             let (code, len) = cl_codes[sym as usize];
-            writer.write_bits_reversed(code, len);
+            writer.write_bits(code, len);
 
             // Write extra bits for RLE symbols
             match sym {
@@ -520,13 +520,13 @@ impl HuffmanEncoder {
             match token {
                 LZ77Token::Literal(byte) => {
                     let (code, len) = lit_codes[*byte as usize];
-                    writer.write_bits_reversed(code, len);
+                    writer.write_bits(code, len);
                 }
                 LZ77Token::Copy { length, distance } => {
                     // Encode length
                     if let Some((len_code, extra_val, extra_bits)) = encode_length(*length) {
                         let (code, code_len) = lit_codes[len_code as usize];
-                        writer.write_bits_reversed(code, code_len);
+                        writer.write_bits(code, code_len);
                         if extra_bits > 0 {
                             writer.write_bits(extra_val as u32, extra_bits);
                         }
@@ -535,7 +535,7 @@ impl HuffmanEncoder {
                     // Encode distance
                     if let Some((dist_code, extra_val, extra_bits)) = encode_distance(*distance) {
                         let (code, code_len) = dist_codes[dist_code as usize];
-                        writer.write_bits_reversed(code, code_len);
+                        writer.write_bits(code, code_len);
                         if extra_bits > 0 {
                             writer.write_bits(extra_val as u32, extra_bits);
                         }
@@ -543,7 +543,7 @@ impl HuffmanEncoder {
                 }
                 LZ77Token::EndOfBlock => {
                     let (code, len) = lit_codes[256];
-                    writer.write_bits_reversed(code, len);
+                    writer.write_bits(code, len);
                 }
             }
         }
@@ -644,7 +644,7 @@ fn build_codes_from_lengths(lengths: &[u8]) -> Vec<(u32, u8)> {
     let mut codes = vec![(0u32, 0u8); lengths.len()];
     for (sym, &len) in lengths.iter().enumerate() {
         if len > 0 {
-            codes[sym] = (next_code[len as usize], len);
+            codes[sym] = (crate::bits::writer::reverse_bits(next_code[len as usize], len), len);
             next_code[len as usize] += 1;
         }
     }
@@ -770,5 +770,41 @@ mod tests {
         // First 5, then repeat 6 (max for symbol 16), then repeat 3
         assert!(encoded.len() >= 2);
         assert_eq!(encoded[0].0, 5); // First literal
+    }
+
+    /// Round-trip test: encode tokens with pre-reversed Huffman codes, then
+    /// inflate via flate2 to verify the output is correct DEFLATE.
+    #[test]
+    fn test_encode_roundtrip_fixed() {
+        use std::io::Read;
+        let input = b"Hello, World! This is a round-trip test for fixed Huffman encoding.";
+        let tokens: Vec<LZ77Token> = input.iter().map(|&b| LZ77Token::Literal(b)).collect();
+
+        let mut encoder = HuffmanEncoder::new(true);
+        let deflate_data = encoder.encode(&tokens, true).unwrap();
+
+        let mut inflated = Vec::new();
+        flate2::read::DeflateDecoder::new(&deflate_data[..])
+            .read_to_end(&mut inflated)
+            .expect("flate2 should inflate fixed Huffman output");
+        assert_eq!(inflated, input);
+    }
+
+    /// Round-trip test for dynamic Huffman encoding.
+    #[test]
+    fn test_encode_roundtrip_dynamic() {
+        use std::io::Read;
+        // Use varied input to exercise dynamic code tables
+        let input: Vec<u8> = (0u8..=127).cycle().take(512).collect();
+        let tokens: Vec<LZ77Token> = input.iter().map(|&b| LZ77Token::Literal(b)).collect();
+
+        let mut encoder = HuffmanEncoder::new(false);
+        let deflate_data = encoder.encode(&tokens, true).unwrap();
+
+        let mut inflated = Vec::new();
+        flate2::read::DeflateDecoder::new(&deflate_data[..])
+            .read_to_end(&mut inflated)
+            .expect("flate2 should inflate dynamic Huffman output");
+        assert_eq!(inflated, input);
     }
 }
