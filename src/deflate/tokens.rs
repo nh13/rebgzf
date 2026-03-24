@@ -1,5 +1,5 @@
 /// Represents a single token in the LZ77 stream
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LZ77Token {
     /// A literal byte
     Literal(u8),
