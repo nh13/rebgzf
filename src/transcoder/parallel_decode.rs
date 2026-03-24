@@ -17,6 +17,7 @@ use crossbeam::channel::{bounded, Receiver, Sender};
 use super::block_scanner::scan_for_block;
 use super::boundary::{tokens_to_bytes, BoundaryResolver};
 use super::single::{parse_gzip_header_size, SingleThreadedTranscoder};
+use super::splitter::{BlockSplitter, DefaultSplitter, FastqSplitter};
 use crate::bgzf::{GziEntry, BGZF_EOF};
 use crate::bits::{BitRead, SliceBitReader};
 use crate::deflate::parser::parse_dynamic_huffman_tables;
@@ -24,7 +25,7 @@ use crate::deflate::tables::{DISTANCE_TABLE, LENGTH_TABLE};
 use crate::deflate::LZ77Token;
 use crate::error::{Error, Result};
 use crate::huffman::{HuffmanDecoder, HuffmanEncoder};
-use crate::{TranscodeConfig, TranscodeStats};
+use crate::{FormatProfile, TranscodeConfig, TranscodeStats};
 
 /// Minimum DEFLATE region size (in bytes) to justify parallelism.
 const MIN_REGION_BYTES: usize = 512 * 1024;
@@ -141,6 +142,20 @@ impl ParallelDecodeTranscoder {
         let mut writer = BufWriter::with_capacity(self.config.buffer_size, output);
         let mut resolver = BoundaryResolver::new();
 
+        // Smart boundary splitting (matching single-threaded path)
+        let use_smart = self.config.use_smart_boundaries();
+        let mut splitter: Box<dyn BlockSplitter> =
+            if use_smart && self.config.format == FormatProfile::Fastq {
+                Box::new(FastqSplitter::new())
+            } else {
+                Box::new(DefaultSplitter)
+            };
+        let max_block_size = if use_smart {
+            (self.config.block_size as f64 * 1.1) as usize
+        } else {
+            self.config.block_size
+        };
+
         let mut pending_tokens: Vec<LZ77Token> = Vec::with_capacity(32768);
         let mut pending_uncompressed_size: usize = 0;
         let mut block_start_position: u64 = 0;
@@ -165,9 +180,18 @@ impl ParallelDecodeTranscoder {
                 }
 
                 let token_size = token.uncompressed_size();
+                splitter.process_token(&token);
 
-                let should_emit = pending_uncompressed_size + token_size > self.config.block_size
-                    && !pending_tokens.is_empty();
+                let should_emit = if use_smart {
+                    let near_target =
+                        pending_uncompressed_size + token_size >= self.config.block_size;
+                    let at_good_split = splitter.is_good_split_point();
+                    let exceeds_max = pending_uncompressed_size + token_size > max_block_size;
+                    !pending_tokens.is_empty() && ((near_target && at_good_split) || exceeds_max)
+                } else {
+                    pending_uncompressed_size + token_size > self.config.block_size
+                        && !pending_tokens.is_empty()
+                };
 
                 if should_emit {
                     let (resolved, uncompressed_size) =
@@ -198,6 +222,7 @@ impl ParallelDecodeTranscoder {
                     block_start_position = resolver.position();
                     pending_tokens.clear();
                     pending_uncompressed_size = 0;
+                    splitter.reset();
                 }
 
                 pending_uncompressed_size += token_size;
