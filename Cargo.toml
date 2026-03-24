@@ -44,7 +44,7 @@ libc = "0.2.183"
 flate2 = "1.0"
 # Use local bgzf for testing (clone from https://github.com/fulcrumgenomics/bgzf)
 # bgzf = { path = "../bgzf" }
-criterion = "0.5"
+criterion = "0.8"
 
 [[bench]]
 name = "transcode"
