@@ -58,17 +58,8 @@ impl ParallelDecodeTranscoder {
 
     /// Transcode from a memory-mapped gzip byte slice to a writer.
     ///
-    /// Combined scan+decode approach (rapidgzip-style):
-    /// Each thread scans for candidate block boundaries AND decodes from them.
-    /// If decoding from a candidate fails or produces too few tokens, the thread
-    /// tries the next candidate. This eliminates false positive boundaries.
-    ///
-    /// **Limitation**: assumes the input is a single-member gzip file. For multi-member
-    /// gzip (e.g. concatenated `.gz` files), `deflate_end = data.len() - 8` only locates
-    /// the trailer of the *last* member, causing the parallel decoder to treat intermediate
-    /// member boundaries as part of the DEFLATE stream. Multi-member files fall back to the
-    /// single-threaded transcoder (via `region < MIN_REGION_BYTES` or thread count 1),
-    /// which correctly handles multi-member via `read_trailer_and_check_next`.
+    /// Falls back to single-threaded for multi-member gzip files (detected by
+    /// checking for a valid gzip header after the first member's trailer).
     pub fn transcode_mmap<W: Write>(&mut self, data: &[u8], output: W) -> Result<TranscodeStats> {
         let header_size = parse_gzip_header_size(data)?;
         let deflate_end = data.len().saturating_sub(8);
@@ -79,13 +70,15 @@ impl ParallelDecodeTranscoder {
             return self.fallback(data, output);
         }
 
-        let chunk_size = region / num_threads;
+        // Detect multi-member gzip: check if there's a valid gzip header
+        // after the first member's DEFLATE stream + 8-byte trailer.
+        // This is cheaper than scanning the whole file for 1f 8b magic bytes
+        // and avoids false positives from DEFLATE-compressed data.
+        if is_multi_member(data, header_size) {
+            return self.fallback(data, output);
+        }
 
-        // Combined Phase 1+2: Each thread scans for a valid boundary and decodes.
-        // Thread 0 starts at the known DEFLATE start (no scanning needed).
-        // Phase 1+2+3: Parallel decode with streaming handoff to resolve+encode.
-        // Tokens are consumed in chunk order as they become available, keeping
-        // peak memory proportional to one chunk rather than the entire file.
+        let chunk_size = region / num_threads;
         self.scan_and_decode_streaming(
             data,
             header_size,
@@ -391,6 +384,127 @@ impl ParallelDecodeTranscoder {
     }
 }
 
+/// Check if mmap'd data contains multiple gzip members by decoding the first
+/// member's DEFLATE stream to find its end, then checking for another header.
+///
+/// This follows the actual DEFLATE structure rather than scanning for magic bytes
+/// (which can appear inside compressed data as false positives).
+fn is_multi_member(data: &[u8], header_size: usize) -> bool {
+    // Decode the first member to find where BFINAL is, then check after trailer
+    let start_bit = header_size * 8;
+    let end_bit = data.len() * 8;
+
+    let mut bits = SliceBitReader::new(data);
+    let start_byte = start_bit / 8;
+    let start_bit_offset = (start_bit % 8) as u8;
+    bits.set_bit_position(start_byte, start_bit_offset);
+
+    // Walk DEFLATE blocks until BFINAL
+    loop {
+        let (cur_byte, cur_bit) = bits.bit_position();
+        let cur_abs_bit = cur_byte * 8 + cur_bit as usize;
+        if cur_abs_bit >= end_bit {
+            return false; // Ran out of data — single member
+        }
+
+        let bfinal = match bits.read_bits(1) {
+            Ok(v) => v != 0,
+            Err(_) => return false,
+        };
+        let btype = match bits.read_bits(2) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+
+        match btype {
+            0 => {
+                // Stored block: skip LEN + NLEN + data
+                bits.align_to_byte();
+                let len = match bits.read_u16_le() {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+                let nlen = match bits.read_u16_le() {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+                if len != !nlen {
+                    return false;
+                }
+                // Skip `len` bytes of stored data
+                for _ in 0..len {
+                    if bits.read_bits(8).is_err() {
+                        return false;
+                    }
+                }
+            }
+            1 | 2 => {
+                // Huffman block: must decode symbols to find EOB (symbol 256)
+                let (lit_decoder, dist_decoder) = if btype == 1 {
+                    (HuffmanDecoder::fixed_literal_length(), Some(HuffmanDecoder::fixed_distance()))
+                } else {
+                    match parse_dynamic_huffman_tables(&mut bits) {
+                        Ok((lit, dist)) => (lit, dist),
+                        Err(_) => return false,
+                    }
+                };
+
+                // Decode symbols until EOB, discarding them
+                loop {
+                    let sym = match lit_decoder.decode(&mut bits) {
+                        Ok(s) => s,
+                        Err(_) => return false,
+                    };
+                    if sym == 256 {
+                        break; // EOB
+                    }
+                    if sym > 256 {
+                        // Length code: skip extra bits + distance code + extra bits
+                        if sym > 285 {
+                            return false;
+                        }
+                        let len_idx = (sym - 257) as usize;
+                        let (_, extra_bits) = LENGTH_TABLE[len_idx];
+                        if extra_bits > 0 && bits.read_bits(extra_bits).is_err() {
+                            return false;
+                        }
+                        let dist_dec = match &dist_decoder {
+                            Some(d) => d,
+                            None => return false,
+                        };
+                        let dist_sym = match dist_dec.decode(&mut bits) {
+                            Ok(s) => s,
+                            Err(_) => return false,
+                        };
+                        if dist_sym > 29 {
+                            return false;
+                        }
+                        let (_, dist_extra) = DISTANCE_TABLE[dist_sym as usize];
+                        if dist_extra > 0 && bits.read_bits(dist_extra).is_err() {
+                            return false;
+                        }
+                    }
+                }
+            }
+            _ => return false, // Reserved block type
+        }
+
+        if bfinal {
+            // Found end of first member's DEFLATE stream.
+            // Align to byte boundary, skip 8-byte trailer (CRC32 + ISIZE).
+            bits.align_to_byte();
+            let (trailer_byte, _) = bits.bit_position();
+            let after_trailer = trailer_byte + 8;
+
+            // Check if a valid gzip header follows
+            if after_trailer + 10 <= data.len() {
+                return parse_gzip_header_size(&data[after_trailer..]).is_ok();
+            }
+            return false; // No room for another member
+        }
+    }
+}
+
 /// Minimum tokens a probe decode must produce to accept a candidate boundary.
 const MIN_PROBE_TOKENS: usize = 1000;
 
@@ -658,6 +772,46 @@ mod tests {
         let st_dec = gzip_decompress(&st_output);
         let pd_dec = gzip_decompress(&pd_output);
         assert_eq!(st_dec, pd_dec);
+    }
+
+    #[test]
+    fn test_is_multi_member_single() {
+        let gz = gzip_compress(b"hello world");
+        let header_size = parse_gzip_header_size(&gz).unwrap();
+        assert!(!is_multi_member(&gz, header_size));
+    }
+
+    #[test]
+    fn test_is_multi_member_two_members() {
+        let gz1 = gzip_compress(b"hello");
+        let gz2 = gzip_compress(b"world");
+        let mut concat = Vec::new();
+        concat.extend_from_slice(&gz1);
+        concat.extend_from_slice(&gz2);
+        let header_size = parse_gzip_header_size(&concat).unwrap();
+        assert!(is_multi_member(&concat, header_size));
+    }
+
+    #[test]
+    fn test_multi_member_roundtrip() {
+        // Multi-member should fall back to single-threaded and still produce correct output
+        let data1 = make_fastq(500);
+        let data2 = make_fastq(500);
+        let mut concat_gz = Vec::new();
+        concat_gz.extend_from_slice(&gzip_compress(&data1));
+        concat_gz.extend_from_slice(&gzip_compress(&data2));
+
+        let config = TranscodeConfig { num_threads: 4, ..Default::default() };
+        let mut transcoder = ParallelDecodeTranscoder::new(config).with_min_region_bytes(0);
+
+        let mut bgzf_output = Vec::new();
+        transcoder.transcode_mmap(&concat_gz, &mut bgzf_output).unwrap();
+
+        let decompressed = gzip_decompress(&bgzf_output);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&data1);
+        expected.extend_from_slice(&data2);
+        assert_eq!(decompressed, expected);
     }
 
     #[test]
