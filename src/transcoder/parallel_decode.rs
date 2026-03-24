@@ -17,6 +17,10 @@ use crossbeam::channel::{bounded, Receiver, Sender};
 
 use super::block_scanner::scan_for_block;
 use super::boundary::BoundaryResolver;
+use super::encoding::{
+    buffer_and_write_block, encoding_worker, send_job_and_drain, write_single_block, EncodedBlock,
+    EncodingJob,
+};
 use super::single::{parse_gzip_header_size, SingleThreadedTranscoder};
 use super::splitter::{BlockSplitter, DefaultSplitter, FastqSplitter};
 use crate::bgzf::{GziEntry, BGZF_EOF};
@@ -25,7 +29,7 @@ use crate::deflate::parser::parse_dynamic_huffman_tables;
 use crate::deflate::tables::{DISTANCE_TABLE, LENGTH_TABLE};
 use crate::deflate::LZ77Token;
 use crate::error::{Error, Result};
-use crate::huffman::{HuffmanDecoder, HuffmanEncoder};
+use crate::huffman::HuffmanDecoder;
 use crate::{FormatProfile, TranscodeConfig, TranscodeStats};
 
 /// Minimum DEFLATE region size (in bytes) to justify parallelism.
@@ -68,7 +72,7 @@ impl ParallelDecodeTranscoder {
     pub fn transcode_mmap<W: Write>(&mut self, data: &[u8], output: W) -> Result<TranscodeStats> {
         let header_size = parse_gzip_header_size(data)?;
         let deflate_end = data.len().saturating_sub(8);
-        let num_threads = self.effective_threads();
+        let num_threads = self.config.effective_threads();
 
         let region = deflate_end.saturating_sub(header_size);
         if region < self.min_region_bytes || num_threads <= 1 {
@@ -304,7 +308,7 @@ impl ParallelDecodeTranscoder {
         let slots: Vec<ChunkSlot> =
             (0..num_threads).map(|_| Arc::new((Mutex::new(None), Condvar::new()))).collect();
 
-        let encoding_threads = self.effective_threads();
+        let encoding_threads = self.config.effective_threads();
         let channel_capacity = encoding_threads * 4;
         let use_fixed_huffman = self.config.use_fixed_huffman();
 
@@ -384,13 +388,6 @@ impl ParallelDecodeTranscoder {
     fn fallback<W: Write>(&self, data: &[u8], output: W) -> Result<TranscodeStats> {
         let mut single = SingleThreadedTranscoder::new(self.config.clone());
         single.transcode_slice(data, output)
-    }
-
-    fn effective_threads(&self) -> usize {
-        match self.config.num_threads {
-            0 => num_cpus::get().clamp(1, 32),
-            n => n.clamp(1, 32),
-        }
     }
 }
 
@@ -587,198 +584,6 @@ fn decode_huffman_block(
         tokens.push(LZ77Token::Copy { length, distance });
     }
 
-    Ok(())
-}
-
-// --- Parallel encoding infrastructure ---
-
-/// A job for a worker thread to encode a resolved BGZF block.
-struct EncodingJob {
-    block_id: u64,
-    tokens: Vec<LZ77Token>,
-    uncompressed_size: u32,
-    crc: u32,
-}
-
-/// Result from a worker: an encoded BGZF block ready to write.
-struct EncodedBlock {
-    block_id: u64,
-    data: Vec<u8>,
-    uncompressed_size: u32,
-}
-
-/// Worker thread: receives resolved token blocks, encodes BGZF.
-fn encoding_worker(
-    job_rx: Receiver<EncodingJob>,
-    result_tx: Sender<Result<EncodedBlock>>,
-    use_fixed_huffman: bool,
-) {
-    let mut encoder = HuffmanEncoder::new(use_fixed_huffman);
-
-    while let Ok(job) = job_rx.recv() {
-        let crc = job.crc;
-        let isize = job.uncompressed_size;
-
-        let result = match encoder.encode(&job.tokens, true) {
-            Ok(deflate_data) => {
-                let block_size = 18 + deflate_data.len() + 8;
-                let bsize = block_size - 1;
-                let mut data = Vec::with_capacity(block_size);
-
-                data.extend_from_slice(&[
-                    0x1f,
-                    0x8b,
-                    0x08,
-                    0x04,
-                    0x00,
-                    0x00,
-                    0x00,
-                    0x00,
-                    0x00,
-                    0xff,
-                    0x06,
-                    0x00,
-                    0x42,
-                    0x43,
-                    0x02,
-                    0x00,
-                    (bsize & 0xFF) as u8,
-                    ((bsize >> 8) & 0xFF) as u8,
-                ]);
-                data.extend_from_slice(&deflate_data);
-                data.extend_from_slice(&crc.to_le_bytes());
-                data.extend_from_slice(&isize.to_le_bytes());
-
-                Ok(EncodedBlock { block_id: job.block_id, data, uncompressed_size: isize })
-            }
-            Err(e) => Err(e),
-        };
-
-        if result_tx.send(result).is_err() {
-            break;
-        }
-    }
-}
-
-/// Send a job to workers, draining results if the channel is full (prevents deadlock).
-#[allow(clippy::too_many_arguments)]
-fn send_job_and_drain<W: Write>(
-    job_tx: &Sender<EncodingJob>,
-    result_rx: &Receiver<Result<EncodedBlock>>,
-    job: EncodingJob,
-    writer: &mut W,
-    pending_blocks: &mut BTreeMap<u64, EncodedBlock>,
-    next_write_id: &mut u64,
-    blocks_written: &mut u64,
-    output_bytes: &mut u64,
-    build_index: bool,
-    index_entries: &mut Vec<GziEntry>,
-    current_compressed_offset: &mut u64,
-    current_uncompressed_offset: &mut u64,
-) -> Result<()> {
-    let mut job_to_send = Some(job);
-    while let Some(j) = job_to_send.take() {
-        match job_tx.try_send(j) {
-            Ok(()) => {}
-            Err(crossbeam::channel::TrySendError::Full(returned)) => {
-                job_to_send = Some(returned);
-                match result_rx.recv() {
-                    Ok(result) => {
-                        let block = result?;
-                        buffer_and_write_block(
-                            writer,
-                            block,
-                            pending_blocks,
-                            next_write_id,
-                            blocks_written,
-                            output_bytes,
-                            build_index,
-                            index_entries,
-                            current_compressed_offset,
-                            current_uncompressed_offset,
-                        )?;
-                    }
-                    Err(_) => return Err(Error::Internal("Result channel disconnected".into())),
-                }
-            }
-            Err(crossbeam::channel::TrySendError::Disconnected(_)) => {
-                return Err(Error::Internal("Workers disconnected".into()));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Buffer an out-of-order block, writing consecutive blocks when possible.
-#[allow(clippy::too_many_arguments)]
-fn buffer_and_write_block<W: Write>(
-    writer: &mut W,
-    block: EncodedBlock,
-    pending: &mut BTreeMap<u64, EncodedBlock>,
-    next_write_id: &mut u64,
-    blocks_written: &mut u64,
-    output_bytes: &mut u64,
-    build_index: bool,
-    index_entries: &mut Vec<GziEntry>,
-    current_compressed_offset: &mut u64,
-    current_uncompressed_offset: &mut u64,
-) -> Result<()> {
-    if block.block_id == *next_write_id {
-        write_single_block(
-            writer,
-            &block.data,
-            block.uncompressed_size,
-            output_bytes,
-            build_index,
-            index_entries,
-            current_compressed_offset,
-            current_uncompressed_offset,
-        )?;
-        *blocks_written += 1;
-        *next_write_id += 1;
-
-        while let Some(buffered) = pending.remove(next_write_id) {
-            write_single_block(
-                writer,
-                &buffered.data,
-                buffered.uncompressed_size,
-                output_bytes,
-                build_index,
-                index_entries,
-                current_compressed_offset,
-                current_uncompressed_offset,
-            )?;
-            *blocks_written += 1;
-            *next_write_id += 1;
-        }
-    } else {
-        pending.insert(block.block_id, block);
-    }
-    Ok(())
-}
-
-/// Write one BGZF block to output and update tracking.
-#[allow(clippy::too_many_arguments)]
-fn write_single_block<W: Write>(
-    writer: &mut W,
-    data: &[u8],
-    uncompressed_size: u32,
-    output_bytes: &mut u64,
-    build_index: bool,
-    index_entries: &mut Vec<GziEntry>,
-    current_compressed_offset: &mut u64,
-    current_uncompressed_offset: &mut u64,
-) -> Result<()> {
-    if build_index {
-        index_entries.push(GziEntry {
-            compressed_offset: *current_compressed_offset,
-            uncompressed_offset: *current_uncompressed_offset,
-        });
-    }
-    *output_bytes += data.len() as u64;
-    writer.write_all(data).map_err(Error::Io)?;
-    *current_compressed_offset += data.len() as u64;
-    *current_uncompressed_offset += uncompressed_size as u64;
     Ok(())
 }
 

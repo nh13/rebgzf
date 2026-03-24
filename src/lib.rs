@@ -137,6 +137,14 @@ impl TranscodeConfig {
     pub fn use_smart_boundaries(&self) -> bool {
         self.compression_level.use_smart_boundaries() || self.format == FormatProfile::Fastq
     }
+
+    /// Number of encoding threads to use, resolving 0 to auto-detect.
+    pub fn effective_threads(&self) -> usize {
+        match self.num_threads {
+            0 => num_cpus::get().clamp(1, 32),
+            n => n.clamp(1, 32),
+        }
+    }
 }
 
 impl Default for TranscodeConfig {

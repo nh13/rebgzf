@@ -1,5 +1,6 @@
 pub mod block_scanner;
 pub mod boundary;
+pub mod encoding;
 pub mod parallel;
 pub mod parallel_decode;
 pub mod single;

@@ -11,35 +11,16 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use crossbeam::channel::{bounded, Receiver, Sender};
 
 use super::boundary::BoundaryResolver;
+use super::encoding::{
+    buffer_and_write_block, encoding_worker, send_job_and_drain, write_single_block, EncodedBlock,
+    EncodingJob,
+};
 use super::splitter::{BlockSplitter, DefaultSplitter, FastqSplitter};
 use crate::bgzf::{GziEntry, BGZF_EOF};
 use crate::deflate::{DeflateParser, LZ77Token};
 use crate::error::{Error, Result};
 use crate::gzip::GzipHeader;
-use crate::huffman::HuffmanEncoder;
 use crate::{FormatProfile, TranscodeConfig, TranscodeStats, Transcoder};
-
-/// A job for encoding a single BGZF block
-struct EncodingJob {
-    /// Sequence number for ordering output
-    block_id: u64,
-    /// Resolved LZ77 tokens for this block
-    tokens: Vec<LZ77Token>,
-    /// Uncompressed size (pre-computed during boundary resolution)
-    uncompressed_size: u32,
-    /// CRC32 of uncompressed data (pre-computed during boundary resolution)
-    crc: u32,
-}
-
-/// Result of encoding a single BGZF block
-struct EncodedBlock {
-    /// Sequence number for ordering output
-    block_id: u64,
-    /// Raw BGZF block data (header + deflate + footer)
-    data: Vec<u8>,
-    /// Uncompressed size for index building
-    uncompressed_size: u32,
-}
 
 /// Parallel transcoder implementation
 pub struct ParallelTranscoder {
@@ -50,18 +31,11 @@ impl ParallelTranscoder {
     pub fn new(config: TranscodeConfig) -> Self {
         Self { config }
     }
-
-    fn effective_threads(&self) -> usize {
-        match self.config.num_threads {
-            0 => num_cpus::get().clamp(1, 32),
-            n => n.clamp(1, 32),
-        }
-    }
 }
 
 impl Transcoder for ParallelTranscoder {
     fn transcode<R: Read, W: Write>(&mut self, input: R, output: W) -> Result<TranscodeStats> {
-        let num_threads = self.effective_threads();
+        let num_threads = self.config.effective_threads();
 
         // For single thread, delegate to single-threaded implementation for efficiency
         if num_threads == 1 {
@@ -100,7 +74,7 @@ impl ParallelTranscoder {
                 let result_tx = result_tx.clone();
 
                 scope.spawn(move |_| {
-                    worker_thread(job_rx, result_tx, use_fixed_huffman);
+                    encoding_worker(job_rx, result_tx, use_fixed_huffman);
                 });
             }
 
@@ -211,46 +185,20 @@ impl ParallelTranscoder {
                         next_block_id += 1;
 
                         // Send job, draining results as needed to prevent deadlock
-                        // Use try_send to avoid cloning - it returns the job on failure
-                        let mut job_to_send = Some(job);
-                        while let Some(job) = job_to_send.take() {
-                            match job_tx.try_send(job) {
-                                Ok(()) => {
-                                    // Sent successfully
-                                }
-                                Err(crossbeam::channel::TrySendError::Full(returned_job)) => {
-                                    // Channel full - put job back and drain a result
-                                    job_to_send = Some(returned_job);
-                                    match result_rx.recv() {
-                                        Ok(result) => {
-                                            let block = result?;
-                                            Self::buffer_and_write_block(
-                                                &mut writer,
-                                                block,
-                                                &mut pending_blocks,
-                                                &mut next_write_id,
-                                                &mut blocks_written,
-                                                &mut output_bytes,
-                                                build_index,
-                                                &mut index_entries,
-                                                &mut current_compressed_offset,
-                                                &mut current_uncompressed_offset,
-                                            )?;
-                                        }
-                                        Err(_) => {
-                                            return Err(Error::Internal(
-                                                "Result channel disconnected".to_string(),
-                                            ));
-                                        }
-                                    }
-                                }
-                                Err(crossbeam::channel::TrySendError::Disconnected(_)) => {
-                                    return Err(Error::Internal(
-                                        "Workers disconnected".to_string(),
-                                    ));
-                                }
-                            }
-                        }
+                        send_job_and_drain(
+                            &job_tx,
+                            &result_rx,
+                            job,
+                            &mut writer,
+                            &mut pending_blocks,
+                            &mut next_write_id,
+                            &mut blocks_written,
+                            &mut output_bytes,
+                            build_index,
+                            &mut index_entries,
+                            &mut current_compressed_offset,
+                            &mut current_uncompressed_offset,
+                        )?;
 
                         block_start_position = resolver.position();
                         pending_tokens.clear();
@@ -291,7 +239,7 @@ impl ParallelTranscoder {
             match result_rx.recv() {
                 Ok(result) => {
                     let block = result?;
-                    Self::buffer_and_write_block(
+                    buffer_and_write_block(
                         &mut writer,
                         block,
                         &mut pending_blocks,
@@ -310,7 +258,7 @@ impl ParallelTranscoder {
 
         // Write any remaining buffered blocks
         while let Some(block) = pending_blocks.remove(&next_write_id) {
-            Self::write_single_block(
+            write_single_block(
                 &mut writer,
                 &block.data,
                 block.uncompressed_size,
@@ -341,150 +289,6 @@ impl ParallelTranscoder {
             index_entries: if build_index { Some(index_entries) } else { None },
         })
     }
-
-    #[allow(clippy::too_many_arguments)]
-    fn buffer_and_write_block<W: Write>(
-        writer: &mut W,
-        block: EncodedBlock,
-        pending: &mut BTreeMap<u64, EncodedBlock>,
-        next_write_id: &mut u64,
-        blocks_written: &mut u64,
-        output_bytes: &mut u64,
-        build_index: bool,
-        index_entries: &mut Vec<GziEntry>,
-        current_compressed_offset: &mut u64,
-        current_uncompressed_offset: &mut u64,
-    ) -> Result<()> {
-        if block.block_id == *next_write_id {
-            // Write this block and track index
-            Self::write_single_block(
-                writer,
-                &block.data,
-                block.uncompressed_size,
-                output_bytes,
-                build_index,
-                index_entries,
-                current_compressed_offset,
-                current_uncompressed_offset,
-            )?;
-            *blocks_written += 1;
-            *next_write_id += 1;
-
-            // Write any consecutive buffered blocks
-            while let Some(buffered) = pending.remove(next_write_id) {
-                Self::write_single_block(
-                    writer,
-                    &buffered.data,
-                    buffered.uncompressed_size,
-                    output_bytes,
-                    build_index,
-                    index_entries,
-                    current_compressed_offset,
-                    current_uncompressed_offset,
-                )?;
-                *blocks_written += 1;
-                *next_write_id += 1;
-            }
-        } else {
-            // Buffer out-of-order block
-            pending.insert(block.block_id, block);
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn write_single_block<W: Write>(
-        writer: &mut W,
-        data: &[u8],
-        uncompressed_size: u32,
-        output_bytes: &mut u64,
-        build_index: bool,
-        index_entries: &mut Vec<GziEntry>,
-        current_compressed_offset: &mut u64,
-        current_uncompressed_offset: &mut u64,
-    ) -> Result<()> {
-        // Record index entry before writing
-        if build_index {
-            index_entries.push(GziEntry {
-                compressed_offset: *current_compressed_offset,
-                uncompressed_offset: *current_uncompressed_offset,
-            });
-        }
-
-        // Write the block
-        *output_bytes += data.len() as u64;
-        writer.write_all(data)?;
-
-        // Update offsets for next block
-        *current_compressed_offset += data.len() as u64;
-        *current_uncompressed_offset += uncompressed_size as u64;
-
-        Ok(())
-    }
-}
-
-/// Worker thread function: encodes tokens to BGZF blocks
-fn worker_thread(
-    job_rx: Receiver<EncodingJob>,
-    result_tx: Sender<Result<EncodedBlock>>,
-    use_fixed_huffman: bool,
-) {
-    let mut encoder = HuffmanEncoder::new(use_fixed_huffman);
-
-    while let Ok(job) = job_rx.recv() {
-        let result = encode_block(&mut encoder, job);
-
-        if result_tx.send(result).is_err() {
-            // Main thread has stopped, exit
-            break;
-        }
-    }
-}
-
-/// Encode a single BGZF block
-fn encode_block(encoder: &mut HuffmanEncoder, job: EncodingJob) -> Result<EncodedBlock> {
-    let crc = job.crc;
-    let isize = job.uncompressed_size;
-
-    // Encode to DEFLATE
-    let deflate_data = encoder.encode(&job.tokens, true)?;
-
-    // Build complete BGZF block
-    let block_size = 18 + deflate_data.len() + 8; // header + deflate + footer
-    let bsize = block_size - 1;
-
-    let mut data = Vec::with_capacity(block_size);
-
-    // Header
-    data.extend_from_slice(&[
-        0x1f,
-        0x8b, // gzip magic
-        0x08, // compression method (DEFLATE)
-        0x04, // flags (FEXTRA)
-        0x00,
-        0x00,
-        0x00,
-        0x00, // mtime
-        0x00, // extra flags
-        0xff, // OS (unknown)
-        0x06,
-        0x00, // xlen = 6
-        0x42,
-        0x43, // subfield ID "BC"
-        0x02,
-        0x00, // subfield length = 2
-        (bsize & 0xFF) as u8,
-        ((bsize >> 8) & 0xFF) as u8,
-    ]);
-
-    // Deflate data
-    data.extend_from_slice(&deflate_data);
-
-    // Footer: CRC32 + ISIZE
-    data.extend_from_slice(&crc.to_le_bytes());
-    data.extend_from_slice(&isize.to_le_bytes());
-
-    Ok(EncodedBlock { block_id: job.block_id, data, uncompressed_size: isize })
 }
 
 #[cfg(test)]
@@ -524,13 +328,11 @@ mod tests {
     #[test]
     fn test_effective_threads() {
         let config = TranscodeConfig { num_threads: 0, ..Default::default() };
-        let transcoder = ParallelTranscoder::new(config);
-        let threads = transcoder.effective_threads();
+        let threads = config.effective_threads();
         assert!(threads >= 1);
         assert!(threads <= 32);
 
         let config2 = TranscodeConfig { num_threads: 100, ..Default::default() };
-        let transcoder2 = ParallelTranscoder::new(config2);
-        assert_eq!(transcoder2.effective_threads(), 32); // Capped at 32
+        assert_eq!(config2.effective_threads(), 32); // Capped at 32
     }
 }
