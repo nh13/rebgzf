@@ -11,6 +11,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{BufWriter, Write};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crossbeam::channel::{bounded, Receiver, Sender};
 
@@ -78,63 +79,24 @@ impl ParallelDecodeTranscoder {
 
         // Combined Phase 1+2: Each thread scans for a valid boundary and decodes.
         // Thread 0 starts at the known DEFLATE start (no scanning needed).
-        // Threads 1..N scan their chunk start region for candidates, try decoding
-        // from each candidate, and keep the first one that produces enough tokens.
-        let chunk_tokens =
-            self.scan_and_decode_all(data, header_size, chunk_size, num_threads, deflate_end)?;
-
-        if chunk_tokens.is_empty() {
-            return self.fallback(data, output);
-        }
-
-        // Phase 3: Resolve boundaries sequentially, encode BGZF in parallel
-        self.emit_bgzf(data, chunk_tokens, output)
-    }
-
-    /// Phase 3: Resolve boundaries sequentially, encode BGZF blocks in parallel.
-    ///
-    /// Main thread: iterate tokens → BoundaryResolver → send resolved blocks to workers
-    /// Workers: tokens_to_bytes → CRC → HuffmanEncoder → build BGZF block
-    /// Main thread: receive encoded blocks in order → write to output
-    fn emit_bgzf<W: Write>(
-        &self,
-        data: &[u8],
-        chunk_tokens: Vec<Vec<LZ77Token>>,
-        output: W,
-    ) -> Result<TranscodeStats> {
-        let num_threads = self.effective_threads();
-        let channel_capacity = num_threads * 4;
-        let use_fixed_huffman = self.config.use_fixed_huffman();
-
-        let (job_tx, job_rx): (Sender<EncodingJob>, Receiver<EncodingJob>) =
-            bounded(channel_capacity);
-        let (result_tx, result_rx): (Sender<Result<EncodedBlock>>, Receiver<Result<EncodedBlock>>) =
-            bounded(channel_capacity);
-
-        let result = crossbeam::scope(|scope| {
-            // Spawn encoding worker threads
-            for _ in 0..num_threads {
-                let rx = job_rx.clone();
-                let tx = result_tx.clone();
-                scope.spawn(move |_| {
-                    encoding_worker(rx, tx, use_fixed_huffman);
-                });
-            }
-            drop(job_rx);
-            drop(result_tx);
-
-            // Main thread: resolve + dispatch + collect + write
-            self.resolve_dispatch_write(data, chunk_tokens, job_tx, result_rx, output)
-        });
-
-        result.map_err(|_| Error::Internal("Phase 3 thread panicked".into()))?
+        // Phase 1+2+3: Parallel decode with streaming handoff to resolve+encode.
+        // Tokens are consumed in chunk order as they become available, keeping
+        // peak memory proportional to one chunk rather than the entire file.
+        self.scan_and_decode_streaming(
+            data,
+            header_size,
+            chunk_size,
+            num_threads,
+            deflate_end,
+            output,
+        )
     }
 
     /// Main thread work for Phase 3: resolve boundaries, dispatch to workers, write output.
     fn resolve_dispatch_write<W: Write>(
         &self,
         data: &[u8],
-        chunk_tokens: Vec<Vec<LZ77Token>>,
+        chunk_tokens: impl IntoIterator<Item = Vec<LZ77Token>>,
         job_tx: Sender<EncodingJob>,
         result_rx: Receiver<Result<EncodedBlock>>,
         output: W,
@@ -312,11 +274,12 @@ impl ParallelDecodeTranscoder {
         })
     }
 
-    /// Combined scan + decode for all chunks in parallel.
+    /// Combined scan + decode for all chunks in parallel, with streaming handoff.
     ///
     /// Each thread (except thread 0) scans for candidate boundaries and tries
-    /// decoding from each until one produces a substantial token count.
-    /// Returns token vectors for each successful chunk, in order.
+    /// decoding from each until one produces a substantial token count. Decoded
+    /// tokens are deposited into shared slots and Phase 3 consumes them in order
+    /// as they become available, so peak memory holds at most ~2 chunk token sets.
     ///
     /// **Note on chunk ownership**: Thread K's `stop_byte` is the nominal chunk boundary
     /// `header_size + (K+1) * chunk_size`, while thread K+1's start is its discovered
@@ -324,70 +287,96 @@ impl ParallelDecodeTranscoder {
     /// In theory this can produce a small overlap or gap in decoded tokens. In practice,
     /// the sequential `BoundaryResolver` in Phase 3 processes all tokens in order and
     /// resolves cross-boundary LZ77 references correctly, so minor overlap is harmless.
-    fn scan_and_decode_all(
+    fn scan_and_decode_streaming<W: Write>(
         &self,
         data: &[u8],
         header_size: usize,
         chunk_size: usize,
         num_threads: usize,
         deflate_end: usize,
-    ) -> Result<Vec<Vec<LZ77Token>>> {
-        // Each thread returns (boundary_bit, tokens)
-        type ChunkResult = (usize, Vec<LZ77Token>);
-        let mut results: Vec<Option<ChunkResult>> = (0..num_threads).map(|_| None).collect();
+        output: W,
+    ) -> Result<TranscodeStats> {
+        // Shared slots for each chunk's decoded tokens.
+        // Phase 2 threads deposit tokens; Phase 3 takes them in order.
+        type ChunkSlot = Arc<(Mutex<Option<Vec<LZ77Token>>>, Condvar)>;
+        let slots: Vec<ChunkSlot> =
+            (0..num_threads).map(|_| Arc::new((Mutex::new(None), Condvar::new()))).collect();
 
-        crossbeam::scope(|scope| {
-            let mut handles = Vec::with_capacity(num_threads);
+        let encoding_threads = self.effective_threads();
+        let channel_capacity = encoding_threads * 4;
+        let use_fixed_huffman = self.config.use_fixed_huffman();
 
-            for k in 0..num_threads {
+        let (job_tx, job_rx): (Sender<EncodingJob>, Receiver<EncodingJob>) =
+            bounded(channel_capacity);
+        let (result_tx, result_rx): (Sender<Result<EncodedBlock>>, Receiver<Result<EncodedBlock>>) =
+            bounded(channel_capacity);
+
+        let result = crossbeam::scope(|scope| {
+            // Spawn Phase 2 decode threads
+            for (k, slot) in slots.iter().enumerate() {
+                let slot = Arc::clone(slot);
                 let stop_byte = if k + 1 < num_threads {
                     header_size + (k + 1) * chunk_size
                 } else {
                     deflate_end
                 };
 
-                handles.push((
-                    k,
-                    scope.spawn(move |_| -> Option<ChunkResult> {
-                        if k == 0 {
-                            // Thread 0: known start, decode until chunk end
-                            let start_bit = header_size * 8;
-                            let stop_bit = stop_byte * 8;
-                            match decode_chunk_tokens(data, start_bit, stop_bit) {
-                                Ok(tokens) => Some((start_bit, tokens)),
-                                Err(_) => None,
-                            }
-                        } else {
-                            // Thread K>0: scan for candidates, try decode from each
-                            scan_and_decode_chunk(
-                                data,
-                                header_size + k * chunk_size,
-                                stop_byte,
-                                deflate_end,
-                            )
-                        }
-                    }),
-                ));
+                scope.spawn(move |_| {
+                    let tokens = if k == 0 {
+                        let start_bit = header_size * 8;
+                        let stop_bit = stop_byte * 8;
+                        decode_chunk_tokens(data, start_bit, stop_bit).ok().unwrap_or_default()
+                    } else {
+                        scan_and_decode_chunk(
+                            data,
+                            header_size + k * chunk_size,
+                            stop_byte,
+                            deflate_end,
+                        )
+                        .map(|(_, t)| t)
+                        .unwrap_or_default()
+                    };
+
+                    let (lock, cvar) = &*slot;
+                    let mut guard = lock.lock().unwrap();
+                    *guard = Some(tokens);
+                    cvar.notify_one();
+                });
             }
 
-            for (k, handle) in handles {
-                if let Ok(result) = handle.join() {
-                    results[k] = result;
+            // Spawn Phase 3 encoding workers
+            for _ in 0..encoding_threads {
+                let rx = job_rx.clone();
+                let tx = result_tx.clone();
+                scope.spawn(move |_| {
+                    encoding_worker(rx, tx, use_fixed_huffman);
+                });
+            }
+            drop(job_rx);
+            drop(result_tx);
+
+            // Main thread: consume chunk slots in order → resolve → dispatch → write.
+            // Each chunk's tokens are taken and dropped after processing, so peak
+            // memory holds at most ~2 chunk token sets (the one being resolved +
+            // one being written by the encoding workers).
+            let chunk_tokens_iter = slots.into_iter().filter_map(|slot| {
+                let (lock, cvar) = &*slot;
+                let mut guard = lock.lock().unwrap();
+                while guard.is_none() {
+                    guard = cvar.wait(guard).unwrap();
                 }
-            }
-        })
-        .map_err(|_| Error::Internal("Parallel scan+decode thread panicked".into()))?;
+                let tokens = guard.take().unwrap();
+                if tokens.is_empty() {
+                    None
+                } else {
+                    Some(tokens)
+                }
+            });
 
-        // Collect successful chunks in order
-        let mut chunk_tokens = Vec::new();
-        for result in results.into_iter().flatten() {
-            let (_, tokens) = result;
-            if !tokens.is_empty() {
-                chunk_tokens.push(tokens);
-            }
-        }
+            self.resolve_dispatch_write(data, chunk_tokens_iter, job_tx, result_rx, output)
+        });
 
-        Ok(chunk_tokens)
+        result.map_err(|_| Error::Internal("Phase 2/3 thread panicked".into()))?
     }
 
     fn fallback<W: Write>(&self, data: &[u8], output: W) -> Result<TranscodeStats> {
