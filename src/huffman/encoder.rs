@@ -357,6 +357,55 @@ impl HuffmanEncoder {
         Ok(writer.finish())
     }
 
+    /// Encode a single token using fixed Huffman codes.
+    /// Used by fused resolve+encode paths to avoid intermediate token Vecs.
+    #[inline]
+    pub fn encode_token_fixed(&self, writer: &mut BitWriter, token: &LZ77Token) {
+        match token {
+            LZ77Token::Literal(byte) => {
+                let (code, len) = self.fixed_lit_codes[*byte as usize];
+                writer.write_bits(code, len);
+            }
+            LZ77Token::Copy { length, distance } => {
+                if let Some((len_code, extra_val, extra_bits)) = encode_length(*length) {
+                    let (code, code_len) = self.fixed_lit_codes[len_code as usize];
+                    writer.write_bits(code, code_len);
+                    if extra_bits > 0 {
+                        writer.write_bits(extra_val as u32, extra_bits);
+                    }
+                }
+                if let Some((dist_code, extra_val, extra_bits)) = encode_distance(*distance) {
+                    let (code, code_len) = self.fixed_dist_codes[dist_code as usize];
+                    writer.write_bits(code, code_len);
+                    if extra_bits > 0 {
+                        writer.write_bits(extra_val as u32, extra_bits);
+                    }
+                }
+            }
+            LZ77Token::EndOfBlock => {
+                let (code, len) = self.fixed_lit_codes[256];
+                writer.write_bits(code, len);
+            }
+        }
+    }
+
+    /// Write an end-of-block symbol using fixed Huffman codes.
+    #[inline]
+    pub fn write_eob_fixed(&self, writer: &mut BitWriter) {
+        let (code, len) = self.fixed_lit_codes[256];
+        writer.write_bits(code, len);
+    }
+
+    /// Access fixed literal codes (for fused resolve+encode paths).
+    pub fn fixed_lit_codes(&self) -> &[(u32, u8)] {
+        &self.fixed_lit_codes
+    }
+
+    /// Access fixed distance codes (for fused resolve+encode paths).
+    pub fn fixed_dist_codes(&self) -> &[(u32, u8)] {
+        &self.fixed_dist_codes
+    }
+
     fn encode_fixed(&self, writer: &mut BitWriter, tokens: &[LZ77Token]) -> Result<()> {
         for token in tokens {
             match token {

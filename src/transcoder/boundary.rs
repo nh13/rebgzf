@@ -1,4 +1,7 @@
+use crate::bits::BitWriter;
+use crate::deflate::tables::{encode_distance, encode_length};
 use crate::deflate::tokens::LZ77Token;
+use crate::huffman::HuffmanEncoder;
 
 /// Maximum LZ77 back-reference distance (32KB).
 const MAX_DISTANCE: usize = 32768;
@@ -144,6 +147,95 @@ impl BoundaryResolver {
         self.rotate_tail();
 
         (output, crc, uncompressed_size)
+    }
+
+    /// Fused resolve + encode for fixed Huffman (single-threaded path).
+    ///
+    /// Resolves cross-boundary references AND encodes to DEFLATE in one pass,
+    /// eliminating the intermediate `Vec<LZ77Token>` and the second token iteration.
+    /// Only valid for fixed Huffman (levels 1-3) since dynamic requires a frequency pass.
+    ///
+    /// Returns: (DEFLATE bytes, CRC32, uncompressed size)
+    pub fn resolve_and_encode_fixed(
+        &mut self,
+        block_start: u64,
+        tokens: &[LZ77Token],
+        encoder: &HuffmanEncoder,
+    ) -> (Vec<u8>, u32, u32) {
+        let mut writer = BitWriter::with_capacity(tokens.len() * 2);
+        writer.write_bit(true); // BFINAL
+        writer.write_bits(1, 2); // BTYPE = 01 (fixed Huffman)
+
+        let lit_codes = encoder.fixed_lit_codes();
+        let dist_codes = encoder.fixed_dist_codes();
+
+        for token in tokens {
+            match token {
+                LZ77Token::Literal(byte) => {
+                    self.push_byte(*byte);
+                    self.position += 1;
+                    // Encode literal directly
+                    let (code, len) = lit_codes[*byte as usize];
+                    writer.write_bits(code, len);
+                }
+
+                LZ77Token::Copy { length, distance } => {
+                    let ref_start = self.position.saturating_sub(*distance as u64);
+
+                    if ref_start < block_start {
+                        // Cross-boundary: resolve to literals and encode each
+                        let dist = *distance as usize;
+                        let len = *length as usize;
+                        let src_start = self.decode_buf.len() - dist;
+                        for i in 0..len {
+                            let byte = self.decode_buf[src_start + (i % dist)];
+                            self.push_byte(byte);
+                            let (code, code_len) = lit_codes[byte as usize];
+                            writer.write_bits(code, code_len);
+                        }
+                        self.refs_resolved += 1;
+                    } else {
+                        // Within-block: encode as Copy
+                        self.copy_from_back(*distance, *length);
+                        if let Some((len_code, extra_val, extra_bits)) = encode_length(*length) {
+                            let (code, code_len) = lit_codes[len_code as usize];
+                            writer.write_bits(code, code_len);
+                            if extra_bits > 0 {
+                                writer.write_bits(extra_val as u32, extra_bits);
+                            }
+                        }
+                        if let Some((dist_code, extra_val, extra_bits)) = encode_distance(*distance)
+                        {
+                            let (code, code_len) = dist_codes[dist_code as usize];
+                            writer.write_bits(code, code_len);
+                            if extra_bits > 0 {
+                                writer.write_bits(extra_val as u32, extra_bits);
+                            }
+                        }
+                        self.refs_preserved += 1;
+                    }
+
+                    self.position += *length as u64;
+                }
+
+                LZ77Token::EndOfBlock => {}
+            }
+        }
+
+        // Write end-of-block symbol
+        let (code, len) = lit_codes[256];
+        writer.write_bits(code, len);
+
+        let deflate_data = writer.finish();
+
+        // CRC over the current block's contiguous bytes
+        let block_bytes = &self.decode_buf[self.tail_len..self.tail_len + self.current_len];
+        let crc = crc32fast::hash(block_bytes);
+        let uncompressed_size = self.current_len as u32;
+
+        self.rotate_tail();
+
+        (deflate_data, crc, uncompressed_size)
     }
 
     /// Get the current position in uncompressed stream
