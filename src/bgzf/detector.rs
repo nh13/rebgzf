@@ -4,7 +4,6 @@
 //! (all blocks) for BGZF files.
 
 use crate::error::{Error, Result};
-use flate2::read::DeflateDecoder;
 use std::io::{Read, Seek, SeekFrom};
 
 /// Result of BGZF validation
@@ -300,18 +299,22 @@ pub fn verify_bgzf<R: Read>(reader: &mut R) -> Result<BgzfVerification> {
         let stored_crc = u32::from_le_bytes([footer[0], footer[1], footer[2], footer[3]]);
         let stored_isize = u32::from_le_bytes([footer[4], footer[5], footer[6], footer[7]]);
 
-        // Decompress data
-        let mut decompressed = Vec::new();
-        let mut decoder = DeflateDecoder::new(&compressed_data[..]);
-        if let Err(e) = decoder.read_to_end(&mut decompressed) {
-            result.is_valid_bgzf = false;
-            if result.first_error.is_none() {
-                result.first_error_block = Some(result.block_count);
-                result.first_error = Some(format!("Decompression failed: {}", e));
+        // Decompress data using libdeflate
+        let mut decompressor = libdeflater::Decompressor::new();
+        let mut decompressed = vec![0u8; stored_isize as usize];
+        match decompressor.deflate_decompress(&compressed_data, &mut decompressed) {
+            Ok(actual_size) => {
+                decompressed.truncate(actual_size);
             }
-            // Continue checking other blocks for stats
-            result.block_count += 1;
-            continue;
+            Err(e) => {
+                result.is_valid_bgzf = false;
+                if result.first_error.is_none() {
+                    result.first_error_block = Some(result.block_count);
+                    result.first_error = Some(format!("Decompression failed: {:?}", e));
+                }
+                result.block_count += 1;
+                continue;
+            }
         }
 
         // Verify ISIZE

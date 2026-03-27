@@ -24,12 +24,18 @@ path = "src/bin/rebgzf.rs"
 # CRC32 for BGZF footer
 crc32fast = "1.3"
 
-# DEFLATE decompression for --verify mode
+# Fast DEFLATE decompression (verify mode, parallel decode)
+libdeflater = "1.22"
+
+# DEFLATE streaming fallback (retained for from_reader path)
 flate2 = "1.1"
 
 # Parallel processing
 crossbeam = "0.8"
 num_cpus = "1.16"
+
+# Fast byte scanning
+memchr = "2"
 
 # Error handling
 thiserror = "2.0"
@@ -45,9 +51,14 @@ flate2 = "1.1"
 # Use local bgzf for testing (clone from https://github.com/fulcrumgenomics/bgzf)
 # bgzf = { path = "../bgzf" }
 criterion = "0.8"
+tempfile = "3"
 
 [[bench]]
 name = "transcode"
+harness = false
+
+[[bench]]
+name = "reader"
 harness = false
 
 [profile.release]
