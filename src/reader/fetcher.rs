@@ -176,21 +176,40 @@ impl ChunkFetcher {
     /// lazy batch decoding instead of pre-decoding everything here.
     pub fn from_data(data: &[u8], config: FetcherConfig) -> Result<Self> {
         let members = scan_gzip_members(data);
-
-        // Single member: parse header and delegate to the existing path.
-        if members.is_empty() {
-            return Err(Error::Internal("no gzip members found".into()));
+        match members.as_slice() {
+            [] => Err(Error::Internal("no gzip members found".into())),
+            [member] => Self::from_member(data, *member, config),
+            _ => Err(Error::Internal(
+                "multiple gzip members detected; use decode_member_batch for concatenated streams"
+                    .into(),
+            )),
         }
+    }
 
-        let (start, end) = members[0];
+    /// Create a fetcher for a single gzip member with known byte boundaries.
+    ///
+    /// Use this when member boundaries have already been scanned (e.g. via
+    /// [`scan_gzip_members`]) to avoid a redundant scan.
+    pub fn from_member(data: &[u8], member: (usize, usize), config: FetcherConfig) -> Result<Self> {
+        let (start, end) = member;
+        if start >= end || end > data.len() {
+            return Err(Error::Internal(format!(
+                "invalid member range ({start}, {end}) for input of {} bytes",
+                data.len()
+            )));
+        }
         let member_data = &data[start..end];
         let mut cursor = std::io::Cursor::new(member_data);
         let _header = GzipHeader::parse(&mut cursor)
             .map_err(|e| Error::Internal(format!("gzip header: {e}")))?;
-        let header_size = start + cursor.position() as usize;
+        let header_len = cursor.position() as usize;
+        if member_data.len() < header_len + 8 {
+            return Err(Error::Internal(format!("member range ({start}, {end}) is truncated")));
+        }
+        let header_size = start + header_len;
 
         // Trailer is last 8 bytes of the member.
-        let deflate_end = end.saturating_sub(8);
+        let deflate_end = end - 8;
 
         Self::new(data, header_size, deflate_end, config)
     }
@@ -231,13 +250,26 @@ fn is_gzip_header(data: &[u8], pos: usize) -> bool {
     GzipHeader::parse(&mut cursor).is_ok()
 }
 
-/// Scan file data for gzip member boundaries.
+/// Scan file data for gzip member boundaries (heuristic).
 ///
 /// Returns a list of `(member_start, member_end)` byte offset pairs.
 /// Each member spans from its gzip header to the byte before the next member
 /// (or EOF).
 ///
-/// Strategy: first try exact-match scanning using the first member's complete
+/// # Heuristic behaviour
+///
+/// This scanner uses two strategies to locate member boundaries and may produce
+/// **false positives** (byte sequences that look like gzip headers but are not)
+/// or **false negatives** (members with empty payloads or `ISIZE > 1 MiB`).
+/// For uniform-header files produced by `pigz` or `bgzip` the scan is exact.
+///
+/// When consuming the returned boundaries, use [`decode_member_batch`] which
+/// contains a merge-retry path that handles false-positive boundaries
+/// gracefully, or validate each boundary independently before use.
+///
+/// # Strategy
+///
+/// First try exact-match scanning using the first member's complete
 /// header bytes as a signature (fast, no false positives for pigz/bgzip where
 /// all members share identical headers). If the first exact-match scan finds
 /// only one member but the file is large, fall back to structural validation

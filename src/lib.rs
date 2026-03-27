@@ -4,6 +4,7 @@ pub mod deflate;
 pub mod error;
 pub mod gzip;
 pub mod huffman;
+pub mod mmap;
 pub mod reader;
 pub mod transcoder;
 
@@ -13,7 +14,8 @@ pub use bgzf::{
 };
 pub use deflate::tokens::LZ77Token;
 pub use error::{Error, Result};
-pub use reader::ParallelGzipReader;
+pub use mmap::MappedFile;
+pub use reader::{decode_member_batch, scan_gzip_members, ParallelGzipReader};
 pub use transcoder::{
     parallel::ParallelTranscoder, parallel_decode::ParallelDecodeTranscoder,
     single::SingleThreadedTranscoder,
