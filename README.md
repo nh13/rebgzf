@@ -142,15 +142,13 @@ Options:
 
 ```rust
 use rebgzf::{
-    CompressionLevel, FormatProfile, ParallelDecodeTranscoder,
+    CompressionLevel, MappedFile, ParallelDecodeTranscoder,
     TranscodeConfig,
 };
 use std::fs::File;
 
 fn main() -> rebgzf::Result<()> {
-    let input = File::open("input.gz")?;
-    // Safety: file must not be modified while mapped
-    let mmap = unsafe { memmap2::Mmap::map(&input)? };
+    let mmap = MappedFile::open("input.gz")?;
     let output = File::create("output.bgz")?;
 
     let config = TranscodeConfig {
