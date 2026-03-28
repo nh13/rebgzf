@@ -13,11 +13,13 @@ mod speculative;
 mod window_map;
 
 pub use chunk::ChunkData;
-pub use fetcher::{ChunkFetcher, FetcherConfig};
+pub use fetcher::{decode_member_batch, scan_gzip_members, ChunkFetcher, FetcherConfig};
 pub use marker::{apply_window, contains_markers, MarkerValue};
 pub use replacer::replace_markers;
 pub use speculative::{decode_with_libdeflate, speculative_decode};
 pub use window_map::WindowMap;
+
+use crate::mmap::MappedFile;
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -43,7 +45,7 @@ enum ReaderInner {
     /// Multi-member gzip: decompress batches of members on demand.
     MultiMember {
         /// Memory-mapped file data (kept alive for the reader's lifetime).
-        mmap: memmap2::Mmap,
+        mapped: MappedFile,
         /// Byte-offset boundaries for each member: `(start, end)`.
         members: Vec<(usize, usize)>,
         /// Index of the next member to start decoding in the next batch.
@@ -59,8 +61,8 @@ enum ReaderInner {
     },
     /// Single-member gzip: all chunks pre-decoded via speculative parallel decode.
     SingleMember {
-        /// Memory map kept alive for safety.
-        _mmap: memmap2::Mmap,
+        /// Mapped file kept alive for safety.
+        _mapped: MappedFile,
         /// Pre-decoded chunk fetcher.
         fetcher: fetcher::ChunkFetcher,
     },
@@ -81,47 +83,49 @@ impl ParallelGzipReader {
     /// * `threads` - number of worker threads (0 = auto-detect)
     pub fn from_file<P: AsRef<Path>>(path: P, threads: usize) -> io::Result<Self> {
         let file = File::open(path.as_ref())?;
-        let metadata = file.metadata()?;
-
-        if metadata.is_file() && metadata.len() > 0 {
-            // Safety: the file is a regular file that we keep open for the lifetime
-            // of the mmap. We do not write to the mmap.
-            let mmap = unsafe { memmap2::Mmap::map(&file)? };
-
-            let threads = if threads == 0 { num_cpus::get() } else { threads };
-            let config = FetcherConfig { threads, chunk_size: 4 * 1024 * 1024, verify_crc: true };
-
-            let members = fetcher::scan_gzip_members(mmap.as_ref());
-
-            if members.len() > 1 {
-                // Multi-member: set up lazy batch decoding.
-                let batch_size = threads * 64;
-                Ok(Self {
-                    inner: ReaderInner::MultiMember {
-                        mmap,
-                        members,
-                        next_batch_start: 0,
-                        batch_size,
-                        num_threads: threads,
-                        verify_crc: config.verify_crc,
-                        pending_chunks: VecDeque::new(),
-                    },
-                    buffer: Vec::new(),
-                    buffer_pos: 0,
-                })
-            } else {
-                // Single member: pre-decode everything via speculative decode.
-                let fetcher = fetcher::ChunkFetcher::from_data(mmap.as_ref(), config)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-
-                Ok(Self {
-                    inner: ReaderInner::SingleMember { _mmap: mmap, fetcher },
-                    buffer: Vec::new(),
-                    buffer_pos: 0,
-                })
+        let mapped = match MappedFile::try_from_file(file) {
+            Ok(m) => m,
+            Err((_e, file)) => {
+                // Mmap failed (non-regular file, empty, unsupported FS, address
+                // space exhaustion, etc.) — fall back to streaming decode.
+                return Self::from_reader(file, threads);
             }
+        };
+
+        let threads = if threads == 0 { num_cpus::get() } else { threads };
+        let config = FetcherConfig { threads, chunk_size: 4 * 1024 * 1024, verify_crc: true };
+
+        let members = fetcher::scan_gzip_members(&mapped);
+
+        if members.len() > 1 {
+            // Multi-member: set up lazy batch decoding.
+            let batch_size = threads.saturating_mul(64).max(1);
+            Ok(Self {
+                inner: ReaderInner::MultiMember {
+                    mapped,
+                    members,
+                    next_batch_start: 0,
+                    batch_size,
+                    num_threads: threads,
+                    verify_crc: config.verify_crc,
+                    pending_chunks: VecDeque::new(),
+                },
+                buffer: Vec::new(),
+                buffer_pos: 0,
+            })
         } else {
-            Self::from_reader(file, threads)
+            // Single member: use pre-scanned boundaries to avoid redundant scan.
+            let member = members.into_iter().next().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "no gzip members found")
+            })?;
+            let fetcher = fetcher::ChunkFetcher::from_member(&mapped, member, config)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+            Ok(Self {
+                inner: ReaderInner::SingleMember { _mapped: mapped, fetcher },
+                buffer: Vec::new(),
+                buffer_pos: 0,
+            })
         }
     }
 
@@ -153,7 +157,7 @@ impl Read for ParallelGzipReader {
 
         match &mut self.inner {
             ReaderInner::MultiMember {
-                mmap,
+                mapped,
                 members,
                 next_batch_start,
                 batch_size,
@@ -183,11 +187,11 @@ impl Read for ParallelGzipReader {
                         return Ok(0); // EOF
                     }
 
-                    let batch_end = (*next_batch_start + *batch_size).min(members.len());
+                    let batch_end = next_batch_start.saturating_add(*batch_size).min(members.len());
                     let batch_members = &members[*next_batch_start..batch_end];
 
                     let new_chunks = fetcher::decode_member_batch(
-                        mmap.as_ref(),
+                        mapped.as_ref(),
                         batch_members,
                         *num_threads,
                         *verify_crc,

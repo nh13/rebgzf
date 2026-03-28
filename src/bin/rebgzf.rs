@@ -389,18 +389,13 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
 
     let stats = if !is_stdin && !args.progress {
         // Fast path: mmap input for file inputs
-        let file = File::open(&args.input)?;
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        let mmap = rebgzf::MappedFile::open(&args.input)?;
         #[cfg(unix)]
         {
-            let ret = unsafe {
-                libc::madvise(mmap.as_ptr() as *mut libc::c_void, mmap.len(), libc::MADV_SEQUENTIAL)
-            };
-            if ret != 0 && args.verbose {
-                eprintln!(
-                    "Warning: madvise(MADV_SEQUENTIAL) failed: {}",
-                    io::Error::last_os_error()
-                );
+            if let Err(e) = mmap.advise_sequential() {
+                if args.verbose {
+                    eprintln!("Warning: madvise(MADV_SEQUENTIAL) failed: {e}");
+                }
             }
         }
         if config.num_threads == 1 {
