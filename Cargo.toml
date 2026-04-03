@@ -43,7 +43,7 @@ thiserror = "2.0"
 # CLI
 clap = { version = "4.5", features = ["derive"] }
 memmap2 = "0.9.10"
-libc = "0.2.183"
+libc = "0.2.184"
 
 [dev-dependencies]
 # For testing against reference implementations
