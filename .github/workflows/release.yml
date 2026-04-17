@@ -34,7 +34,7 @@ jobs:
         id: tag
         run: echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           draft: false
           prerelease: ${{ contains(github.ref, '-') }}
@@ -93,7 +93,7 @@ jobs:
           cd -
 
       - name: Upload Release Asset
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: rebgzf-${{ needs.create-release.outputs.tag }}-${{ matrix.target }}.tar.gz
 
@@ -163,6 +163,6 @@ jobs:
           SCRIPT
           chmod +x install.sh
       - name: Upload Installer
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: install.sh
